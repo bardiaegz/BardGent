@@ -3,3 +3,4 @@ venv/
 .DS_Store
 Bardgent.md
 .bardgent_sessions/
+bardgent.log
