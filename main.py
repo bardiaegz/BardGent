@@ -8,6 +8,30 @@ from rich.console import Console
 from pathlib import Path
 import json
 import platform
+from urllib.parse import urlparse, parse_qs
+import threading
+from rich.panel import Panel
+
+approved_for_session = set()
+approval_lock = threading.RLock()
+tool_iterations = 0
+
+def ask_approval(key, question, dangerous=False):
+    """Ask the user to approve an action. 'a' remembers the approval for this
+    session (keyed per tool / command). Dangerous actions always ask, default No."""
+    with approval_lock:
+        if dangerous:
+            answer = input(f"{question} [y/N]: ").strip().lower()
+            return answer in ('y', 'yes')
+        if key in approved_for_session:
+            console.print(f"[dim]auto-approved ({key})[/dim]")
+            return True
+        answer = input(f"{question} [Y/n/a=always]: ").strip().lower()
+        if answer in ('a', 'always'):
+            approved_for_session.add(key)
+            return True
+        return answer in ('', 'y', 'yes')
+
 
 python_path = sys.executable
 operating_system = platform.platform()
@@ -36,6 +60,47 @@ def save_memory(text: str):
     console.print(f'\n[bold green]⚙ TOOL:[/bold green] SAVING MEMORY TO Bardgent.md\n')
     return "Memory saved."
 
+def WebSearch(query):
+    headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"}
+    resp = requests.post('https://html.duckduckgo.com/html/', data={'q': query},
+                         headers=headers, timeout=10)
+    resp.raise_for_status()
+    console.print(f'\n[bold green]⚙ TOOL:[/bold green] Web Search: {query}\n')
+    soup = BeautifulSoup(resp.text, 'html.parser')
+    results = []
+    for r in soup.select('.result')[:8]:
+        a = r.select_one('a.result__a')
+        if not a:
+            continue
+        url = a.get('href', '')
+        uddg = parse_qs(urlparse(url).query).get('uddg')
+        if uddg:
+            url = uddg[0]
+        snippet = r.select_one('.result__snippet')
+        entry = f"{a.get_text(strip=True)}\n{url}"
+        if snippet:
+            entry += f"\n{snippet.get_text(strip=True)}"
+        results.append(entry)
+    print(results)
+    return '\n\n'.join(results) if results else '(no results)'
+
+def Fetch(link):
+    console.print(Panel(link, title="[bold yellow]Fetch wants to run", border_style='yellow'))
+
+    if not ask_approval('Fetch', "Fetch this page?"):
+        return "Fetch rejected by user."
+
+    headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"}
+    resp = requests.get(link, headers=headers, timeout=10)
+    resp.raise_for_status()
+    soup = BeautifulSoup(resp.text, "html.parser")
+
+    for tag in soup(["script", "style", "noscript"]):
+        tag.decompose()
+
+    return soup.get_text(separator="\n", strip=True)
+
+
 SYSTEM_INFO = f"""[CRITICAL SYSTEM INFO]:
 - Python Executable Path: {python_path}
 - Operating System: {operating_system}
@@ -50,11 +115,13 @@ You are helpful agent and your name is Bardgent made by Bardia.
 
 {SYSTEM_INFO}
 
-You have access to two tools:
+You have access to these tools:
 
 
 - read_memory(): read long-term memory
 - save_memory(memory): save useful facts
+- WebSearch: Websearch the web
+- Fetch: Fetch web pages
 
 Only save information that will be useful in future conversations.
 Before answering questions that may depend on past context, call read_memory.
@@ -90,7 +157,42 @@ tools = [
                 "required": ["memory"]
             }
         }
-    }
+    },
+    {
+        'type': 'function',
+        'function': {
+            'name': 'Fetch',
+            'description': 'Fetch the content of a web page',
+            'parameters': {
+                'type': 'object',
+                'properties': {
+                    'link': {
+                        'type': 'string',
+                        'description': 'the link of the web page to fetch'
+                        }
+                    },
+                    'required': ['link']
+                }
+            }
+    },
+    {
+        'type': 'function',
+        'function': {
+            'name': 'WebSearch',
+            'description': 'Search the web (DuckDuckGo), returns titles, URLs and snippets. Use Fetch afterwards to read a promising result.',
+            'parameters': {
+                'type': 'object',
+                'properties': {
+                    'query': {
+                        'type': 'string',
+                        'description': 'the search query'
+                        }
+                    },
+                    'required': ['query']
+                }
+            }
+    },
+
 ]
 
 
@@ -115,7 +217,8 @@ while True:
 
         assistant_message = response.choices[0].message
 
-        while assistant_message.tool_calls:
+        while assistant_message.tool_calls and tool_iterations < 5:
+            tool_iterations += 1
             messages.append(assistant_message)
 
             for tool_call in assistant_message.tool_calls:
@@ -125,6 +228,10 @@ while True:
                     result = read_memory()
                 elif name == "save_memory":
                     result = save_memory(args["memory"])
+                elif name == "WebSearch":
+                    result = WebSearch(args["query"])
+                elif name == "Fetch":
+                    result = Fetch(args["link"])
                 else:
                     result = "Unknown tool"
 
@@ -149,4 +256,3 @@ while True:
         })
 
         print(assistant_message.content)
-
