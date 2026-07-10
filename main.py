@@ -92,7 +92,9 @@ def save_memory(text: str):
     with open(MEMORY_FILE, "a", encoding="utf-8") as f:
         f.write(f"\n- {text}\n")
 
+    console.print(f'\n[bold green]⚙ TOOL:[/bold green] SAVING MEMORY TO Bardgent.md\n')
     return "Memory saved."
+
 
 def WebSearch(query):
     headers = {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'}
@@ -123,9 +125,25 @@ def Fetch(link):
         return 'Fetch rejected by user.'
 
     console.print(f'\n[bold green]⚙ TOOL:[/bold green] Fetch\n')
-    headers = {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'}
-    resp = requests.get(link, headers=headers, timeout=10)
-    resp.raise_for_status()
+
+    headers = {
+        'User-Agent': (
+            'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) '
+            'AppleWebKit/537.36 Chrome/120 Safari/537.36'
+        )
+    }
+
+    try:
+        resp = requests.get(link, headers=headers, timeout=10)
+
+        if resp.status_code == 403:
+            return f"Could not fetch page (403 Forbidden): {link}"
+
+        resp.raise_for_status()
+
+    except requests.RequestException as e:
+        return f"Fetch failed: {type(e).__name__}: {e}"
+
     soup = BeautifulSoup(resp.text, 'html.parser')
 
     for tag in soup(['script', 'style', 'noscript']):
