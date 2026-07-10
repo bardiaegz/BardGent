@@ -39,11 +39,11 @@ working_directory = os.getcwd()
 home_directory = os.path.expanduser('~')
 
 client = OpenAI(
-    base_url='http://localhost:8080',
-    api_key='sk-no-key-required'
+    base_url='https://generativelanguage.googleapis.com/v1beta/openai/',
+    api_key=os.environ.get('GEMINI_API_KEY', '')
 )
 
-MODEL = 'unsloth/gemma-4-26B-A4B-it-GGUF:UD-IQ3_S'
+MODEL = 'gemma-4-26b-a4b-it'
 TEMPERATURE = 0.2
 MAX_ITERATIONS = 30
 MAX_HISTORY_MESSAGES = 30
@@ -68,6 +68,28 @@ TELEGRAM_API_BASE = f'https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}'
 TELEGRAM_CHATID_FILE = Path('.bardgent_telegram.json')
 TELEGRAM_MAX_LEN = 4000  # stay under Telegram's 4096-char hard limit with margin
 
+THOUGHT_TAG_RE = re.compile(r"<(?:thought|think)>.*?</(?:thought|think)>", re.DOTALL | re.IGNORECASE)
+THOUGHT_OPEN_RE = re.compile(r"<(?:thought|think)>", re.IGNORECASE)
+
+
+def remove_thoughts(text):
+    """
+    Strip the model's reasoning/thought blocks from text.
+
+    Handles both <thought>...</thought> and <think>...</think> (Gemma models
+    served via the Gemini API don't always use the same tag llama.cpp used),
+    AND a still-open/unterminated block — i.e. the model is mid-thought and
+    the closing tag hasn't streamed in yet. In that case everything from the
+    opening tag onward is cut, so raw thinking text is never shown to the
+    user even partially while it's still being generated.
+    """
+    if not text:
+        return text
+    text = THOUGHT_TAG_RE.sub("", text)
+    m = THOUGHT_OPEN_RE.search(text)
+    if m:
+        text = text[:m.start()]
+    return text.strip()
 
 def _load_telegram_chat_id():
     if TELEGRAM_CHATID_FILE.exists():
@@ -1040,8 +1062,18 @@ def stream_agent_response(messages, tools):
 
             if delta and delta.content:
                 content_parts.append(delta.content)
-                has_output = True
-                live.update(render_agent(''.join(content_parts)))
+                display_text = remove_thoughts(''.join(content_parts))
+                if display_text:
+                    # first real (non-thought) text has arrived — switch from
+                    # the loading spinner to the actual rendered answer
+                    has_output = True
+                    live.update(render_agent(display_text))
+                else:
+                    # still inside a <thought>/<think> block — keep showing
+                    # the loading spinner instead of raw thinking text, and
+                    # do NOT mark has_output yet (so a TOOL call that follows
+                    # a thought still gets its "⚙ TOOL:" announcement below)
+                    live.update(spinner)
 
             if delta and delta.tool_calls:
                 for tc_delta in delta.tool_calls:
@@ -1064,8 +1096,15 @@ def stream_agent_response(messages, tools):
 
     # print_usage(usage)
 
-    ordered_calls = [tool_calls[i] for i in sorted(tool_calls.keys())]
+    # Drop any malformed/nameless tool-call fragments (occasionally seen from
+    # the Gemini API) so we never trigger a wasted extra round-trip on them —
+    # this was the cause of the duplicated "AGENT:" block: a phantom
+    # tool_calls delta with no name would still count as "has tool calls",
+    # so the loop would run the model again for a second, real answer while
+    # the first (empty) answer stayed printed on screen from the first pass.
+    ordered_calls = [tool_calls[i] for i in sorted(tool_calls.keys()) if tool_calls[i].get('name')]
     final_text = ''.join(content_parts)
+    final_text = remove_thoughts(final_text)
     return final_text, ordered_calls, finish_reason
 
 
@@ -1235,6 +1274,7 @@ while True:
                 continue
 
             final_text = final_text.strip()
+            final_text = remove_thoughts(final_text)
             state.messages.append({'role': 'assistant', 'content': final_text})
             if state.telegram_enabled and state.telegram_chat_id and final_text:
                 if not send_telegram_message(final_text, state.telegram_chat_id):
