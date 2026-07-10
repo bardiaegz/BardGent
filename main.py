@@ -17,6 +17,10 @@ from rich.markdown import Markdown
 from prompt_toolkit import PromptSession
 from prompt_toolkit.completion import WordCompleter
 from prompt_toolkit.formatted_text import HTML
+import fnmatch
+import re
+import difflib
+import subprocess
 
 console = Console()
 
@@ -32,7 +36,7 @@ client = OpenAI(
 
 MODEL = 'yuxinlu1/gemma-4-12B-agentic-fable5-composer2.5-v2-3.5x-tau2-GGUF:Q4_K_M'
 TEMPERATURE = 0.2
-MAX_ITERATIONS = 10
+MAX_ITERATIONS = 30
 MAX_HISTORY_MESSAGES = 30
 MAX_TOOL_OUTPUT = 8_000
 
@@ -41,6 +45,11 @@ SESSION_DIR = Path.cwd() / ".bardgent_sessions"
 SESSION_DIR.mkdir(exist_ok=True)
 SESSION_PREFIX = ".bardgent_session_"
 SUMMARY_PREFIX = '[Conversation summary so far]: '
+
+def Read(file_path):
+    path = os.path.abspath(os.path.expanduser(file_path))
+    with open(path, 'r') as f:
+        return f.read()
 
 approved_for_session = set()
 approval_lock = threading.RLock()
@@ -61,6 +70,148 @@ def ask_approval(key, question, dangerous=False):
             approved_for_session.add(key)
             return True
         return answer in ('', 'y', 'yes')
+
+ADD_STYLE = 'white on dark_green'
+DEL_STYLE = 'white on dark_red'
+
+def confirm_diff(old, new, path, tool_name):
+    """Show a Claude Code style diff (full-width green/red line backgrounds,
+    line numbers) of the proposed change and ask for approval."""
+    diff = list(difflib.unified_diff(old.splitlines(), new.splitlines(), lineterm=''))
+    body = Text()
+    bar_width = max(console.width - 6, 40)
+    old_no = new_no = 1
+    first_hunk = True
+
+    for line in diff:
+        if line.startswith(('+++', '---')):
+            continue
+        if line.startswith('@@'):
+            m = re.match(r'@@ -(\d+)(?:,\d+)? \+(\d+)(?:,\d+)? @@', line)
+            if m:
+                old_no, new_no = int(m.group(1)), int(m.group(2))
+            if not first_hunk:
+                body.append('   ⋮\n', style='dim')
+            first_hunk = False
+            continue
+        if line.startswith('+'):
+            body.append(f"{new_no:>4} + {line[1:]}".ljust(bar_width), style=ADD_STYLE)
+            body.append('\n')
+            new_no += 1
+        elif line.startswith('-'):
+            body.append(f"{old_no:>4} - {line[1:]}".ljust(bar_width), style=DEL_STYLE)
+            body.append('\n')
+            old_no += 1
+        else:
+            body.append(f"{new_no:>4}   {line[1:]}\n", style='dim')
+            old_no += 1
+            new_no += 1
+
+    if not body:
+        body = Text('(no changes)', style='dim')
+    with approval_lock:
+        console.print(Panel(body, title=f"[bold yellow]{tool_name}: {path}", border_style='yellow'))
+        return ask_approval(tool_name, "Apply this change?")
+
+def Write(file_path, content):
+    path = os.path.abspath(os.path.expanduser(file_path))
+    old = ''
+    if os.path.exists(path):
+        with open(path, 'r') as f:
+            old = f.read()
+    if not confirm_diff(old, content, path, 'Write'):
+        return f"Write to {path} rejected by user. Do NOT retry it or a variation of it — continue with what you already have, or ask the user in your final answer."
+    with open(path, 'w') as f:
+        f.write(content)
+    return f'Wrote to {path}'
+
+def Edit(file_path, old_str, new_str):
+    path = os.path.abspath(os.path.expanduser(file_path))
+    with open(path, 'r') as f:
+        content = f.read()
+    count = content.count(old_str)
+    if count == 0:
+        return f"Error: old_str not found in {path}"
+    if count > 1:
+        return f"Error: old_str matches {count} times in {path}, must be unique"
+    new_content = content.replace(old_str, new_str)
+    if not confirm_diff(content, new_content, path, 'Edit'):
+        return f"Edit to {path} rejected by user. Do NOT retry it or a variation of it — continue with what you already have, or ask the user in your final answer."
+    with open(path, 'w') as f:
+        f.write(new_content)
+    return f'Edited {path}'
+
+def Glob(pattern):
+    matches = glob.glob(os.path.expanduser(pattern), recursive=True)
+    return '\n'.join(matches) if matches else '(no matches)'
+
+MAX_GREP_MATCHES = 200
+SKIP_DIRS = {'__pycache__', 'node_modules', 'venv', '.venv', 'dist', 'build'}
+
+def Grep(pattern, path='.', include=None):
+    try:
+        regex = re.compile(pattern)
+    except re.error as e:
+        return f"Error: invalid regex: {e}"
+    root = os.path.abspath(os.path.expanduser(path))
+    matches = []
+    for dirpath, dirnames, filenames in os.walk(root):
+        dirnames[:] = [d for d in dirnames if not d.startswith('.') and d not in SKIP_DIRS]
+        for filename in sorted(filenames):
+            if include and not fnmatch.fnmatch(filename, include):
+                continue
+            file_path = os.path.join(dirpath, filename)
+            try:
+                with open(file_path, 'r', encoding='utf-8') as f:
+                    for lineno, line in enumerate(f, 1):
+                        if regex.search(line):
+                            rel = os.path.relpath(file_path, root)
+                            matches.append(f"{rel}:{lineno}: {line.rstrip()}")
+                            if len(matches) >= MAX_GREP_MATCHES:
+                                return '\n'.join(matches) + f"\n(stopped at {MAX_GREP_MATCHES} matches)"
+            except (UnicodeDecodeError, OSError):
+                continue
+    return '\n'.join(matches) if matches else '(no matches)'
+
+DANGEROUS_PATTERNS = [
+    r'\brm\b', r'\brmdir\b', r'\bmv\b', r'\bdd\b',
+    r'\bsudo\b', r'\bchmod\b', r'\bchown\b',
+    r'\bkill\b', r'\bpkill\b', r'\bkillall\b',
+    r'>\s*/', r'\btruncate\b', r'\bmkfs\b',
+    r'\|\s*(sh|bash)\b', r'--force\b', r'--hard\b',
+]
+
+def is_dangerous(command):
+    return any(re.search(p, command) for p in DANGEROUS_PATTERNS)
+
+shell_cwd = os.getcwd()
+CWD_MARKER = '__BARDGENT_CWD__'
+
+def Bash(command):
+    global shell_cwd
+    danger = is_dangerous(command)
+    first_word = (command.strip().split() or [''])[0]
+    key = f"Bash:{first_word}"
+    with approval_lock:
+        if danger or key not in approved_for_session:
+            color = "red" if danger else "yellow"
+            title = "Bash wants to run (DANGEROUS)" if danger else "Bash wants to run"
+            console.print(Panel(command, title=f"[bold {color}]{title}",
+                                subtitle=f"[dim]in {shell_cwd}", border_style=color))
+        if not ask_approval(key, "Run this command?", dangerous=danger):
+            return "Command rejected by user. Do NOT retry it or a variation of it — continue with what you already have, or ask the user in your final answer."
+    # append a marker echoing $PWD so `cd` persists to the next Bash call
+    wrapped = command + f'\nprintf "\\n{CWD_MARKER}%s" "$PWD"'
+    result = subprocess.run(wrapped, shell=True, capture_output=True, text=True, cwd=shell_cwd)
+    stdout, sep, after = result.stdout.rpartition(CWD_MARKER)
+    if sep:
+        new_dir = after.strip()
+        if new_dir and os.path.isdir(new_dir):
+            shell_cwd = new_dir
+        stdout = stdout[:-1] if stdout.endswith('\n') else stdout
+    else:
+        stdout = result.stdout
+    return stdout + result.stderr
 
 
 SYSTEM_INFO = f"""[CRITICAL SYSTEM INFO]:
@@ -158,25 +309,68 @@ def print_welcome():
 
 messages = [
     {
-        'role': 'system',
-        'content': f"""
-You are helpful agent and your name is Bardgent made by Bardia.
+        "role": "system",
+        "content": f"""
+You are a helpful coding agent.
+Your name is Bardgent made by Bardia.
 
 {SYSTEM_INFO}
 
 You have access to these tools:
-- read_memory(): read long-term memory
-- save_memory(memory): save useful facts
-- WebSearch: Websearch the web
-- Fetch: Fetch web pages
 
-Only save information that will be useful in future conversations.
-Before answering questions that may depend on past context, call read_memory.
-Only call save_memory when the user explicitly tells you a new fact about themselves in their most recent message.
+File tools:
+- Read(file_path): Read the content of a file.
+- Write(file_path, content): Write or overwrite a file. Always show the user a diff and ask for approval before writing.
+- Edit(file_path, old_str, new_str): Replace an exact unique string inside a file. Prefer Edit over Write for small changes.
+- Glob(pattern): Find files by name using glob patterns.
+- Grep(pattern, path, include): Search inside files using regex.
 
-Never save information that came from read_memory.
-Never save information that you inferred.
-Never save information that already exists in memory.
+Execution tools:
+- Bash(command): Execute shell commands. The shell keeps its working directory between calls, so `cd` persists.
+
+Web tools:
+- WebSearch(query): Search the web and return results.
+- Fetch(link): Fetch and extract text from a web page.
+
+Memory tools:
+- read_memory(): Read long-term memory.
+- save_memory(memory): Save useful user facts or preferences.
+
+Rules:
+
+- Always use this exact Python executable path when executing Python files:
+  {python_path}
+
+- When the user gives a relative path (for example Desktop/foo/app.py),
+  first try it relative to the current working directory and home directory before searching.
+
+- Before modifying files:
+  - Prefer Edit for small targeted changes.
+  - Use Write only when replacing the entire file or creating a new file.
+  - Always review the diff shown by the tool and respect the user's approval.
+
+- For exploring a codebase:
+  - Use Glob to discover files instead of guessing filenames.
+  - Use Grep to search for functions, classes, variables, or keywords.
+
+- For Bash:
+  - Think before executing commands.
+  - Avoid destructive commands unless explicitly requested.
+  - The Bash working directory persists between calls.
+
+- After every tool call:
+  - Read and understand the result.
+  - Decide whether another tool call is needed.
+  - Only provide the final answer when the task is complete.
+
+- For questions that may depend on previous conversations:
+  call read_memory() before answering.
+
+- Only call save_memory() when the user explicitly tells you a new fact about themselves.
+- Never save information inferred by you.
+- Never save information retrieved from read_memory().
+
+You are a coding agent. Prefer taking action with tools over only explaining what could be done.
 """
     }
 ]
@@ -396,6 +590,42 @@ tools = [
             },
         }
     },
+        {'type': 'function', 'function': {
+        'name': 'Read', 'description': 'Read a file from disk',
+        'parameters': {'type': 'object', 'properties': {'file_path': {'type': 'string'}}, 'required': ['file_path']}
+    }},
+    {'type': 'function', 'function': {
+        'name': 'Write', 'description': 'Write (overwrite) full content to a file',
+        'parameters': {'type': 'object', 'properties': {
+            'file_path': {'type': 'string', 'description': 'the path of the file to write to'},
+            'content': {'type': 'string', 'description': 'the content to write to the file'}
+        }, 'required': ['file_path', 'content']}
+    }},
+    {'type': 'function', 'function': {
+        'name': 'Edit', 'description': 'Replace an exact string match inside a file (must match exactly once)',
+        'parameters': {'type': 'object', 'properties': {
+            'file_path': {'type': 'string'},
+            'old_str': {'type': 'string', 'description': 'exact text to find'},
+            'new_str': {'type': 'string', 'description': 'text to replace it with'}
+        }, 'required': ['file_path', 'old_str', 'new_str']}
+    }},
+    {'type': 'function', 'function': {
+        'name': 'Glob', 'description': 'List/search files matching a glob pattern, e.g. "**/*.py"',
+        'parameters': {'type': 'object', 'properties': {'pattern': {'type': 'string'}}, 'required': ['pattern']}
+    }},
+    {'type': 'function', 'function': {
+        'name': 'Grep', 'description': 'Search file contents for a regex pattern, returns matches as path:line_number: line',
+        'parameters': {'type': 'object', 'properties': {
+            'pattern': {'type': 'string', 'description': 'regex pattern to search for'},
+            'path': {'type': 'string', 'description': 'directory to search in (default: current directory)'},
+            'include': {'type': 'string', 'description': 'only search files matching this glob, e.g. "*.py"'}
+        }, 'required': ['pattern']}
+    }},
+    {'type': 'function', 'function': {
+        'name': 'Bash', 'description': 'Execute a shell command',
+        'parameters': {'type': 'object', 'properties': {'command': {'type': 'string', 'description': 'the command to execute'}}, 'required': ['command']}
+    }},
+
 ]
 
 def render_agent(text):
@@ -493,6 +723,18 @@ while True:
                         result = WebSearch(args['query'])
                     elif name == 'Fetch':
                         result = Fetch(args['link'])
+                    elif name == 'Read':
+                        result = Read(args['file_path'])
+                    elif name == 'Write':
+                        result = Write(args['file_path'], args['content'])
+                    elif name == 'Edit':
+                        result = Edit(args['file_path'], args['old_str'], args['new_str'])
+                    elif name == 'Glob':
+                        result = Glob(args['pattern'])
+                    elif name == 'Grep':
+                        result = Grep(args['pattern'], args.get('path', '.'), args.get('include'))
+                    elif name == 'Bash':
+                        result = Bash(args['command'])
                     else:
                         result = 'Unknown tool'
 
