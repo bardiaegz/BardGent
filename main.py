@@ -15,6 +15,8 @@ from rich.panel import Panel
 from rich.text import Text
 from rich.markdown import Markdown
 from rich.syntax import Syntax
+from rich.live import Live
+from rich.spinner import Spinner
 from prompt_toolkit import PromptSession
 from prompt_toolkit.completion import WordCompleter
 from prompt_toolkit.formatted_text import HTML
@@ -144,7 +146,7 @@ def Write(file_path, content):
         with open(path, 'r') as f:
             old = f.read()
     if not confirm_diff(old, content, path, 'Write'):
-        return f"Write to {path} rejected by user. Do NOT retry it or a variation of it — continue with what you already have, or ask the user in your final answer."
+        return f"Write to {path} rejected by user. Do NOT retry it or a variation of it. continue with what you already have, or ask the user in your final answer."
     with open(path, 'w') as f:
         f.write(content)
     return f'Wrote to {path}'
@@ -160,7 +162,7 @@ def Edit(file_path, old_str, new_str):
         return f"Error: old_str matches {count} times in {path}, must be unique"
     new_content = content.replace(old_str, new_str)
     if not confirm_diff(content, new_content, path, 'Edit'):
-        return f"Edit to {path} rejected by user. Do NOT retry it or a variation of it — continue with what you already have, or ask the user in your final answer."
+        return f"Edit to {path} rejected by user. Do NOT retry it or a variation of it. continue with what you already have, or ask the user in your final answer."
     with open(path, 'w') as f:
         f.write(new_content)
     return f'Edited {path}'
@@ -223,7 +225,7 @@ def Bash(command):
             console.print(Panel(command, title=f"[bold {color}]{title}",
                                 subtitle=f"[dim]in {shell_cwd}", border_style=color))
         if not ask_approval(key, "Run this command?", dangerous=danger):
-            return "Command rejected by user. Do NOT retry it or a variation of it — continue with what you already have, or ask the user in your final answer."
+            return "Command rejected by user. Do NOT retry it or a variation of it. continue with what you already have, or ask the user in your final answer."
     # append a marker echoing $PWD so `cd` persists to the next Bash call
     wrapped = command + f'\nprintf "\\n{CWD_MARKER}%s" "$PWD"'
     result = subprocess.run(wrapped, shell=True, capture_output=True, text=True, cwd=shell_cwd)
@@ -246,7 +248,7 @@ SYSTEM_INFO = f"""[CRITICAL SYSTEM INFO]:
 
 def read_memory():
     if MEMORY_FILE.exists():
-        console.print(f'\n[bold green]⚙ TOOL:[/bold green] READING MEMORY FROM Bardgent.md\n')
+        # console.print(f'\n[bold green]⚙ TOOL:[/bold green] READING MEMORY FROM Bardgent.md\n')
         return MEMORY_FILE.read_text(encoding='utf-8')
     return ''
 
@@ -267,12 +269,12 @@ def save_memory(text: str):
     with open(MEMORY_FILE, "a", encoding="utf-8") as f:
         f.write(f"\n- {text}\n")
 
-    console.print(f'\n[bold green]⚙ TOOL:[/bold green] SAVING MEMORY TO Bardgent.md\n')
+    # console.print(f'\n[bold green]⚙ TOOL:[/bold green] SAVING MEMORY TO Bardgent.md\n')
     return "Memory saved."
 
 
 def WebSearch(query):
-    console.print(f'\n[bold green]⚙ TOOL:[/bold green] Web Search: {query}\n')
+    # console.print(f'\n[bold green]⚙ TOOL:[/bold green] Web Search: {query}\n')
     headers = {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'}
     resp = requests.post('https://html.duckduckgo.com/html/', data={'q': query}, headers=headers, timeout=10)
     console.status("Searching the web...")
@@ -300,7 +302,7 @@ def Fetch(link):
     if not ask_approval('Fetch', 'Fetch this page?'):
         return 'Fetch rejected by user.'
 
-    console.print(f'\n[bold green]⚙ TOOL:[/bold green] Fetch\n')
+    # console.print(f'\n[bold green]⚙ TOOL:[/bold green] Fetch\n')
 
     headers = {
         'User-Agent': (
@@ -660,6 +662,68 @@ def render_agent(text):
     return Group(Text('AGENT:', style='bold cyan'), Markdown(text))
 
 
+def stream_agent_response(messages, tools):
+    stream = client.chat.completions.create(
+        model=MODEL,
+        messages=messages,
+        tools=tools,
+        temperature=TEMPERATURE,
+        stream=True,
+        stream_options={'include_usage': True},
+    )
+
+    content_parts = []
+    tool_calls = {}          # index -> {'id':..., 'name':..., 'arguments': ''}
+    finish_reason = None
+    usage = None
+    has_output = False
+
+    spinner = Spinner('dots', text=Text(' Thinking...', style='cyan'))
+
+    with Live(spinner, console=console, refresh_per_second=12, transient=False) as live:
+        for chunk in stream:
+            if getattr(chunk, 'usage', None):
+                usage = chunk.usage
+            if not chunk.choices:
+                continue
+            choice = chunk.choices[0]
+            delta = choice.delta
+
+            if choice.finish_reason:
+                finish_reason = choice.finish_reason
+
+            if delta and delta.content:
+                content_parts.append(delta.content)
+                has_output = True
+                live.update(render_agent(''.join(content_parts)))
+
+            if delta and delta.tool_calls:
+                for tc_delta in delta.tool_calls:
+                    idx = tc_delta.index
+                    entry = tool_calls.setdefault(idx, {'id': None, 'name': None, 'arguments': ''})
+                    if tc_delta.id:
+                        entry['id'] = tc_delta.id
+                    if tc_delta.function:
+                        if tc_delta.function.name:
+                            entry['name'] = tc_delta.function.name
+                        if tc_delta.function.arguments:
+                            # Concatenate only. Never parse here.
+                            entry['arguments'] += tc_delta.function.arguments
+                if not has_output:
+                    names = ', '.join(t['name'] for t in tool_calls.values() if t['name'])
+                    live.update(Text(f'⚙ TOOL: {names}', style='dim cyan'))
+                    has_output = True
+
+        if not has_output:
+            live.update(Text(''))
+
+    # print_usage(usage)
+
+    ordered_calls = [tool_calls[i] for i in sorted(tool_calls.keys())]
+    final_text = ''.join(content_parts)
+    return final_text, ordered_calls, finish_reason
+
+
 def print_usage(usage):
     if not usage:
         return
@@ -712,36 +776,31 @@ while True:
 
     try:
         for _ in range(MAX_ITERATIONS):
-            response = client.chat.completions.create(
-                model=MODEL,
-                messages=messages,
-                tools=tools,
-                temperature=TEMPERATURE,
-            )
+            final_text, tool_calls, finish_reason = stream_agent_response(messages, tools)
 
-            assistant_message = response.choices[0].message
-            # print_usage(getattr(response, 'usage', None))
-
-            if assistant_message.tool_calls:
+            if tool_calls:
                 messages.append({
                     "role": "assistant",
-                    "content": assistant_message.content,
+                    "content": final_text or None,
                     "tool_calls": [
                         {
-                            "id": tc.id,
+                            "id": tc['id'],
                             "type": "function",
                             "function": {
-                                "name": tc.function.name,
-                                "arguments": tc.function.arguments
+                                "name": tc['name'],
+                                "arguments": tc['arguments']
                             }
                         }
-                        for tc in assistant_message.tool_calls
+                        for tc in tool_calls
                     ]
                 })
 
-                for tool_call in assistant_message.tool_calls:
-                    name = tool_call.function.name
-                    args = json.loads(tool_call.function.arguments or '{}')
+                for tool_call in tool_calls:
+                    name = tool_call['name']
+                    # arguments is the FULLY reassembled string at this point
+                    # (stream_agent_response already joined every chunk by
+                    # index), so this is the only place it gets parsed.
+                    args = json.loads(tool_call['arguments'] or '{}')
 
                     if name == 'read_memory':
                         result = read_memory()
@@ -768,20 +827,21 @@ while True:
 
                     messages.append({
                         'role': 'tool',
-                        'tool_call_id': tool_call.id,
+                        'tool_call_id': tool_call['id'],
                         'content': truncate_output(str(result))
                     })
                 continue
 
-            final_text = (assistant_message.content or '').strip()
+            final_text = final_text.strip()
             messages.append({'role': 'assistant', 'content': final_text})
-            console.print(render_agent(final_text))
+            # Not re-printed here: Live already rendered it on screen as it
+            # streamed in (stream_agent_response uses transient=False).
             break
         else:
             console.print(f'[bold red]Hit max iterations ({MAX_ITERATIONS}) without a final answer.[/bold red]')
 
     except KeyboardInterrupt:
-        console.print('\n[yellow]Interrupted — back to prompt.[/yellow]')
+        console.print('\n[yellow]Interrupted. back to prompt.[/yellow]')
     except Exception as e:
         console.print(f'\n[bold red]Error during turn: {type(e).__name__}: {e}[/bold red]')
 
