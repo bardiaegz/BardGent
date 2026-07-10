@@ -47,11 +47,11 @@ MODEL = 'gemma-4-26b-a4b-it'
 TEMPERATURE = 0.2
 MAX_ITERATIONS = 30
 MAX_HISTORY_MESSAGES = 30
-MAX_TOOL_OUTPUT = 12_000
+MAX_TOOL_OUTPUT = 24_000
 BASH_TIMEOUT_SECONDS = 60
-RESPONSE_TOKEN_RESERVE = 2_048        # tokens guaranteed free for the model's own reply
-MAX_HISTORY_TOKENS = 12_000           # rough budget for kept history
-AUTO_SUMMARY_TOKEN_THRESHOLD = 10_000  # auto-compact via LLM summary above this
+RESPONSE_TOKEN_RESERVE = 8_192        # tokens guaranteed free for the model's own reply
+MAX_HISTORY_TOKENS = 180_000           # rough budget for kept history
+AUTO_SUMMARY_TOKEN_THRESHOLD = 140_000  # auto-compact via LLM summary above this
 
 MEMORY_FILE = Path('Bardgent.md')
 SESSION_DIR = Path.cwd() / ".bardgent_sessions"
