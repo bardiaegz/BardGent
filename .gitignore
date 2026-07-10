@@ -4,3 +4,4 @@ venv/
 Bardgent.md
 .bardgent_sessions/
 bardgent.log
+.bardgent_telegram.json

@@ -27,6 +27,9 @@ import re
 import difflib
 import subprocess
 import datetime
+from dotenv import load_dotenv
+
+load_dotenv()
 
 console = Console()
 
@@ -44,10 +47,11 @@ MODEL = 'unsloth/gemma-4-26B-A4B-it-GGUF:UD-IQ3_S'
 TEMPERATURE = 0.2
 MAX_ITERATIONS = 30
 MAX_HISTORY_MESSAGES = 30
-MAX_TOOL_OUTPUT = 8_000
+MAX_TOOL_OUTPUT = 12_000
 BASH_TIMEOUT_SECONDS = 60
-MAX_HISTORY_TOKENS = 6_000          # rough budget for kept history
-AUTO_SUMMARY_TOKEN_THRESHOLD = 5_000  # auto-compact via LLM summary above this
+RESPONSE_TOKEN_RESERVE = 2_048        # tokens guaranteed free for the model's own reply
+MAX_HISTORY_TOKENS = 12_000           # rough budget for kept history
+AUTO_SUMMARY_TOKEN_THRESHOLD = 10_000  # auto-compact via LLM summary above this
 
 MEMORY_FILE = Path('Bardgent.md')
 SESSION_DIR = Path.cwd() / ".bardgent_sessions"
@@ -58,6 +62,72 @@ SUMMARY_PREFIX = '[Conversation summary so far]: '
 BACKUP_DIR = Path.cwd() / ".bardgent_backups"
 BACKUP_DIR.mkdir(exist_ok=True)
 last_backup = {}
+
+TELEGRAM_BOT_TOKEN = os.environ.get('TELEGRAM_BOT_TOKEN', '')
+TELEGRAM_API_BASE = f'https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}'
+TELEGRAM_CHATID_FILE = Path('.bardgent_telegram.json')
+TELEGRAM_MAX_LEN = 4000  # stay under Telegram's 4096-char hard limit with margin
+
+
+def _load_telegram_chat_id():
+    if TELEGRAM_CHATID_FILE.exists():
+        try:
+            return json.loads(TELEGRAM_CHATID_FILE.read_text(encoding='utf-8')).get('chat_id')
+        except (OSError, json.JSONDecodeError):
+            return None
+    return None
+
+
+def _save_telegram_chat_id(chat_id):
+    try:
+        TELEGRAM_CHATID_FILE.write_text(json.dumps({'chat_id': chat_id}), encoding='utf-8')
+    except OSError as e:
+        console.print(f'[dim red]Could not save Telegram chat id: {e}[/dim red]')
+
+
+def discover_telegram_chat_id(timeout=30):
+    """Poll getUpdates until the user messages the bot, then return their chat id."""
+    console.print(Panel(
+        "Open Telegram, find your bot, and send it any message (e.g. /start).\n"
+        f"Waiting up to {timeout}s...",
+        title='[bold cyan]Telegram setup', border_style='cyan'))
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        try:
+            resp = _with_retries(requests.get, f'{TELEGRAM_API_BASE}/getUpdates', timeout=10, retries=2)
+            resp.raise_for_status()
+            data = resp.json()
+        except (requests.RequestException, ValueError) as e:
+            console.print(f'[dim red]Telegram poll failed: {e}[/dim red]')
+            time.sleep(2)
+            continue
+        results = data.get('result', [])
+        if results:
+            chat = results[-1].get('message', {}).get('chat', {})
+            chat_id = chat.get('id')
+            if chat_id:
+                return chat_id
+        time.sleep(2)
+    return None
+
+
+def send_telegram_message(text, chat_id):
+    if not TELEGRAM_BOT_TOKEN or not chat_id or not text:
+        return False
+    ok = True
+    for i in range(0, len(text), TELEGRAM_MAX_LEN):
+        chunk = text[i:i + TELEGRAM_MAX_LEN]
+        try:
+            resp = _with_retries(
+                requests.post, f'{TELEGRAM_API_BASE}/sendMessage',
+                json={'chat_id': chat_id, 'text': chunk}, timeout=10, retries=2,
+            )
+            resp.raise_for_status()
+        except requests.RequestException as e:
+            log_event(f"TELEGRAM SEND FAILED: {e}")
+            ok = False
+    return ok
+
 
 LOG_FILE = Path.cwd() / 'bardgent.log'
 logging.basicConfig(
@@ -82,6 +152,8 @@ class AgentState:
         self.approved_for_session = set()
         self.approval_lock = threading.RLock()
         self.session_file = (SESSION_DIR / session_file_name()) if track_session else None
+        self.telegram_enabled = False
+        self.telegram_chat_id = _load_telegram_chat_id() if name == 'main' else None
 
 
 def ask_approval(state, key, question, dangerous=False):
@@ -412,8 +484,6 @@ def delete_memory(index):
     MEMORY_FILE.write_text('\n'.join(lines) + '\n', encoding='utf-8')
     log_event(f"MEMORY DELETE #{idx}: {removed}")
     return f'Deleted memory #{idx} ({removed.strip("- ")}).'
-
-
 def _with_retries(func, *args, retries=3, backoff=1.5, **kwargs):
     last_exc = None
     for attempt in range(retries):
@@ -619,6 +689,7 @@ COMMANDS = {
     '/model': 'Show the current model, or switch: /model <n>',
     '/clear': 'Clear history and start a new session',
     '/resume': 'Pick a past session and resume it',
+    '/telegram': 'Toggle sending the agent\'s final answers to Telegram',
     '/exit': 'Quit Bardgent',
 }
 
@@ -681,7 +752,8 @@ def do_summary_and_compact(state):
     response = client.chat.completions.create(
         model=MODEL,
         messages=temp_messages,
-        temperature=TEMPERATURE
+        temperature=TEMPERATURE,
+        max_tokens=RESPONSE_TOKEN_RESERVE,
     )
     summary_text = response.choices[0].message.content or ''
     print_usage(getattr(response, 'usage', None))
@@ -740,8 +812,34 @@ def handle_command(user_input, state):
         do_summary_and_compact(state)
         return 'handled'
 
-    return None
+    if cmd == '/telegram':
+        if not TELEGRAM_BOT_TOKEN:
+            console.print('[bold red]No TELEGRAM_BOT_TOKEN found (check your .env file). Cannot enable Telegram.[/bold red]')
+            return 'handled'
 
+        if state.telegram_enabled:
+            state.telegram_enabled = False
+            console.print('[yellow]Telegram messaging turned off.[/yellow]')
+            log_event("TELEGRAM disabled")
+            return 'handled'
+
+        if not state.telegram_chat_id:
+            chat_id = discover_telegram_chat_id()
+            if not chat_id:
+                console.print('[bold red]No message received from the bot in time. '
+                              'Message your bot on Telegram, then run /telegram again.[/bold red]')
+                return 'handled'
+            state.telegram_chat_id = chat_id
+            _save_telegram_chat_id(chat_id)
+            console.print(f'[bold green]Telegram linked (chat_id={chat_id}).[/bold green]')
+            log_event(f"TELEGRAM linked chat_id={chat_id}")
+
+        state.telegram_enabled = True
+        console.print('[bold green]Telegram messaging turned on — final answers will be sent there too.[/bold green]')
+        log_event("TELEGRAM enabled")
+        return 'handled'
+
+    return None
 
 TOOLS = [
     {'type': 'function', 'function': {
@@ -891,11 +989,31 @@ def render_agent(text):
 
 
 def stream_agent_response(messages, tools):
+    """
+    Calls the model with stream=True and renders the reply live:
+      - Shows a spinner ("Thinking...") until the first chunk arrives.
+      - As text tokens stream in, live-updates the rendered markdown
+        (word-by-word streaming).
+      - Tool call arguments arrive split across many chunks. Each chunk
+        only carries a fragment of the JSON string (e.g. '{"file' then
+        '_path": "a.py' then '"}'), plus an `index` saying which tool
+        call it belongs to (a response can stream several tool calls
+        interleaved). We ONLY concatenate fragments by index here and
+        never json.loads() until the stream is fully consumed — parsing
+        a partial fragment is exactly what caused the "incomplete JSON /
+        bad chunking" error.
+
+    Returns: (final_text, tool_calls, finish_reason)
+      final_text    -> str, the assistant's plain text content (may be '')
+      tool_calls    -> list of {'id', 'name', 'arguments'} dicts, in order
+      finish_reason -> str or None
+    """
     stream = client.chat.completions.create(
         model=MODEL,
         messages=messages,
         tools=tools,
         temperature=TEMPERATURE,
+        max_tokens=RESPONSE_TOKEN_RESERVE,
         stream=True,
         stream_options={'include_usage': True},
     )
@@ -1118,8 +1236,9 @@ while True:
 
             final_text = final_text.strip()
             state.messages.append({'role': 'assistant', 'content': final_text})
-            # Not re-printed here: Live already rendered it on screen as it
-            # streamed in (stream_agent_response uses transient=False).
+            if state.telegram_enabled and state.telegram_chat_id and final_text:
+                if not send_telegram_message(final_text, state.telegram_chat_id):
+                    console.print('[dim red]Could not deliver message to Telegram (see bardgent.log).[/dim red]')
             break
         else:
             console.print(f'[bold red]Hit max iterations ({MAX_ITERATIONS}) without a final answer.[/bold red]')
