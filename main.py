@@ -14,6 +14,7 @@ from rich.console import Console, Group
 from rich.panel import Panel
 from rich.text import Text
 from rich.markdown import Markdown
+from rich.syntax import Syntax
 from prompt_toolkit import PromptSession
 from prompt_toolkit.completion import WordCompleter
 from prompt_toolkit.formatted_text import HTML
@@ -21,6 +22,7 @@ import fnmatch
 import re
 import difflib
 import subprocess
+import datetime
 
 console = Console()
 
@@ -34,7 +36,7 @@ client = OpenAI(
     api_key='sk-no-key-required'
 )
 
-MODEL = 'yuxinlu1/gemma-4-12B-agentic-fable5-composer2.5-v2-3.5x-tau2-GGUF:Q4_K_M'
+MODEL = 'unsloth/gemma-4-26B-A4B-it-GGUF:UD-IQ3_S'
 TEMPERATURE = 0.2
 MAX_ITERATIONS = 30
 MAX_HISTORY_MESSAGES = 30
@@ -95,13 +97,35 @@ def confirm_diff(old, new, path, tool_name):
             first_hunk = False
             continue
         if line.startswith('+'):
-            body.append(f"{new_no:>4} + {line[1:]}".ljust(bar_width), style=ADD_STYLE)
+            # Guess lexer based on file extension, default to python
+            lexer = Path(path).suffix.lstrip('.') or 'python'
+            try:
+                syntax = Syntax(line[1:], lexer, theme='monokai', line_numbers=False)
+                # Render syntax to a Text object, then apply background style
+                rendered = console.render(syntax)
+                for segment in rendered.spans:
+                    segment.style = f"{segment.style} on dark_green" if segment.style else "white on dark_green"
+                body.append(rendered)
+            except:
+                body.append(f"{new_no:>4} + {line[1:]}".ljust(bar_width), style=ADD_STYLE)
             body.append('\n')
             new_no += 1
+        # (Repeat similar logic for '-' lines with dark_red)
         elif line.startswith('-'):
-            body.append(f"{old_no:>4} - {line[1:]}".ljust(bar_width), style=DEL_STYLE)
+            # Guess lexer based on file extension, default to python
+            lexer = Path(path).suffix.lstrip('.') or 'python'
+            try:
+                syntax = Syntax(line[1:], lexer, theme='monokai', line_numbers=False)
+                # Render syntax to a Text object, then apply background style
+                rendered = console.render(syntax)
+                for segment in rendered.spans:
+                    segment.style = f"{segment.style} on dark_red" if segment.style else "white on dark_red"
+                body.append(rendered)
+            except:
+                body.append(f"{new_no:>4} + {line[1:]}".ljust(bar_width), style=DEL_STYLE)
             body.append('\n')
-            old_no += 1
+            new_no += 1
+        # (Repeat similar logic for '-' lines with dark_red)
         else:
             body.append(f"{new_no:>4}   {line[1:]}\n", style='dim')
             old_no += 1
@@ -248,10 +272,11 @@ def save_memory(text: str):
 
 
 def WebSearch(query):
+    console.print(f'\n[bold green]⚙ TOOL:[/bold green] Web Search: {query}\n')
     headers = {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'}
     resp = requests.post('https://html.duckduckgo.com/html/', data={'q': query}, headers=headers, timeout=10)
+    console.status("Searching the web...")
     resp.raise_for_status()
-    console.print(f'\n[bold green]⚙ TOOL:[/bold green] Web Search: {query}\n')
     soup = BeautifulSoup(resp.text, 'html.parser')
     results = []
     for r in soup.select('.result')[:8]:
@@ -306,6 +331,7 @@ def print_welcome():
     console.print(f"[bold italic magenta]Welcome to Bardgent[/bold italic magenta]!")
     console.print("Type 'exit' or 'quit' to leave.\n")
 
+DATETIME = datetime.datetime.now().astimezone()
 
 messages = [
     {
@@ -313,6 +339,8 @@ messages = [
         "content": f"""
 You are a helpful coding agent.
 Your name is Bardgent made by Bardia.
+
+DATETIME: {DATETIME.strftime('%Y-%B-%d %I:%M %p %Z')}
 
 {SYSTEM_INFO}
 
