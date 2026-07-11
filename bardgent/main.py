@@ -2000,10 +2000,23 @@ def main():
     atexit.register(disable_status_bar)
     install_resize_handler(state)
     # draw_status_bar(state, force=True)
-
+    auto_continue = False
     while True:
         try:
-            user_input = prompt_session.prompt(HTML('<ansigreen><b>USER: </b></ansigreen>'), multiline=False).strip()
+            if auto_continue:
+                # Bypass the keyboard prompt, print the instruction, and add it to message history
+                user_input = "Please proceed with executing the proposed plan."
+                console.print(Text("USER: ", style="bold green") + Text(user_input))
+                state.messages.append({'role': 'user', 'content': user_input})
+                auto_continue = False  # Reset for subsequent inputs
+            else:
+                try:
+                    user_input = prompt_session.prompt(HTML('<ansigreen><b>USER: </b></ansigreen>'), multiline=False).strip()
+                except KeyboardInterrupt:
+                    continue
+                except EOFError:
+                    console.print('Goodbye!')
+                    break
         except KeyboardInterrupt:
             continue
         except EOFError:
@@ -2032,6 +2045,7 @@ def main():
             trim_history(state)
 
         try:
+            plan_completed_successfully = False
             for _ in range(MAX_ITERATIONS):
                 final_text, tool_calls, finish_reason = stream_agent_response(state.messages, TOOLS)
 
@@ -2075,9 +2089,38 @@ def main():
                 if state.telegram_enabled and state.telegram_chat_id and final_text:
                     if not send_telegram_message(final_text, state.telegram_chat_id):
                         console.print('[dim red]Could not deliver message to Telegram (see bardgent.log).[/dim red]')
+                plan_completed_successfully = True
                 break
             else:
                 console.print(f'[bold red]Hit max iterations ({MAX_ITERATIONS}) without a final answer.[/bold red]')
+
+            # If we were in plan mode and finished successfully, present clean selection "buttons"
+            if plan_completed_successfully and state.mode == 'plan':
+                console.print()
+                button_strip = (
+                    "Select a mode to execute the proposed plan:\n\n"
+                    "  [bold white on green]  1  [/bold white on green] [bold green]NORMAL MODE[/bold green] (Approve each action)\n"
+                    "  [bold white on red]  2  [/bold white on red] [bold red]AUTO MODE[/bold red]   (Auto-approve non-dangerous actions)\n"
+                    "  [bold white on grey37]  3  [/bold white on grey37] [dim]KEEP PLAN[/dim]   (Stay in read-only mode)\n"
+                )
+                console.print(Panel(button_strip, title="[bold cyan]Next Action[/bold cyan]", border_style="cyan", expand=False))
+                
+                try:
+                    ans = prompt_session.prompt(
+                        HTML('<ansiyellow><b>Select option [1/2/3] (3): </b></ansiyellow>'),
+                        multiline=False
+                    ).strip()
+                except (KeyboardInterrupt, EOFError):
+                    ans = '3'
+                
+                if ans == '1':
+                    switch_mode(state, 'normal')
+                    auto_continue = True
+                elif ans == '2':
+                    switch_mode(state, 'auto')
+                    auto_continue = True
+                else:
+                    console.print("[dim]Remaining in PLAN mode.[/dim]")
 
         except KeyboardInterrupt:
             console.print('\n[yellow]Interrupted! back to prompt.[/yellow]')
