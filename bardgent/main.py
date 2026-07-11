@@ -43,6 +43,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from dotenv import load_dotenv
 
 load_dotenv()
+load_dotenv(Path.expanduser(Path("~/.bardgent/.env")))
 
 console = Console()
 
@@ -137,6 +138,8 @@ def is_tool_permitted(name):
 CHECKPOINT_REF = 'refs/bardgent/checkpoints'
 CHECKPOINT_LOG = PERMISSIONS_DIR / 'checkpoints.json'
 CHECKPOINT_INDEX_FILE = PERMISSIONS_DIR / 'checkpoint.index'
+GLOBAL_DIR = Path.home() / '.bardgent'
+GLOBAL_DIR.mkdir(exist_ok=True)
 
 
 def _git_root(path):
@@ -286,19 +289,19 @@ def _stale_warning(path):
                  f"further assumptions about its old contents.]")
     return ''
 
-MEMORY_FILE = Path('Bardgent.md')
-SESSION_DIR = Path.cwd() / ".bardgent_sessions"
+MEMORY_FILE = GLOBAL_DIR / 'Bardgent.md'
+SESSION_DIR = GLOBAL_DIR / "sessions"
 SESSION_DIR.mkdir(exist_ok=True)
-SESSION_PREFIX = ".bardgent_session_"
+SESSION_PREFIX = "session_"
 SUMMARY_PREFIX = '[Conversation summary so far]: '
 
-BACKUP_DIR = Path.cwd() / ".bardgent_backups"
+BACKUP_DIR = GLOBAL_DIR / "backups"
 BACKUP_DIR.mkdir(exist_ok=True)
 last_backup = {}
 
 TELEGRAM_BOT_TOKEN = os.environ.get('TELEGRAM_BOT_TOKEN', '')
 TELEGRAM_API_BASE = f'https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}'
-TELEGRAM_CHATID_FILE = Path('.bardgent_telegram.json')
+TELEGRAM_CHATID_FILE = GLOBAL_DIR / 'telegram_chat_id.json'
 TELEGRAM_MAX_LEN = 4000  # stay under Telegram's 4096-char hard limit with margin
 
 THOUGHT_TAG_RE = re.compile(r"<(?:thought|think)>.*?</(?:thought|think)>", re.DOTALL | re.IGNORECASE)
@@ -374,7 +377,7 @@ def send_telegram_message(text, chat_id):
     return ok
 
 
-LOG_FILE = Path.cwd() / 'bardgent.log'
+LOG_FILE = GLOBAL_DIR / 'bardgent.log'
 logging.basicConfig(
     filename=LOG_FILE,
     level=logging.INFO,
@@ -872,11 +875,11 @@ def print_welcome():
     console.print(f"[bold italic magenta]Welcome to Bardgent[/bold italic magenta]!")
     console.print("Type 'exit' or 'quit' to leave.")
     console.print("[dim]Shift+Tab cycles mode (normal -> auto -> plan), or use /normal, /auto, /plan.[/dim]")
-    if IS_WARP:
-        console.print(
-            "[dim]Warp terminal detected: it doesn't support a pinned bottom status bar, "
-            "so context/mode will be shown as a line instead.[/dim]"
-        )
+    # if IS_WARP:
+    #     console.print(
+    #         "[dim]Warp terminal detected: it doesn't support a pinned bottom status bar, "
+    #         "so context/mode will be shown as a line instead.[/dim]"
+    #     )
     console.print()
 
 
@@ -1963,135 +1966,128 @@ def install_resize_handler(state):
             pass  # not the main thread, or platform doesn't support it
 
 
-print_welcome()
-log_event("=== Bardgent session start ===")
+def main():
+    global state
+    
+    # Check for API Key before starting
+    if not os.environ.get('GEMINI_API_KEY'):
+        console.print("[bold red]Error: GEMINI_API_KEY is not set.[/bold red]")
+        console.print("Please set it in your environment or add it to ~/.bardgent/.env:")
+        console.print("[yellow]GEMINI_API_KEY=your_key_here[/yellow]")
+        sys.exit(1)
 
-state = AgentState(SYSTEM_PROMPT, name='main')
+    print_welcome()
+    log_event("=== Bardgent session start ===")
 
-# shift+tab cycles normal -> auto -> plan -> normal -> ... without having to
-# type /normal, /auto, /plan by hand. The actual mode change has to happen
-# via run_in_terminal because we're inside prompt_toolkit's key-handling
-# callback here, run_in_terminal briefly suspends the prompt so our rich
-# console.print()s (from switch_mode) land cleanly above it instead of
-# corrupting the input line, then redraws the prompt afterwards.
-_mode_keys = KeyBindings()
+    state = AgentState(SYSTEM_PROMPT, name='main')
+    _mode_keys = KeyBindings()
 
+    # key-bindings callback
+    @_mode_keys.add('s-tab')
+    def _cycle_mode(event):
+        def _do_switch():
+            idx = MODE_CYCLE.index(state.mode) if state.mode in MODE_CYCLE else 0
+            switch_mode(state, MODE_CYCLE[(idx + 1) % len(MODE_CYCLE)])
+        run_in_terminal(_do_switch)
 
-@_mode_keys.add('s-tab')
-def _cycle_mode(event):
-    def _do_switch():
-        idx = MODE_CYCLE.index(state.mode) if state.mode in MODE_CYCLE else 0
-        switch_mode(state, MODE_CYCLE[(idx + 1) % len(MODE_CYCLE)])
-    run_in_terminal(_do_switch)
+    global prompt_session
+    prompt_session = PromptSession(
+        completer=WordCompleter(list(COMMANDS.keys()), sentence=True),
+        key_bindings=_mode_keys,
+    )
 
-
-prompt_session = PromptSession(
-    completer=WordCompleter(list(COMMANDS.keys()), sentence=True),
-    key_bindings=_mode_keys,
-)
-
-enable_status_bar()
-atexit.register(disable_status_bar)
-install_resize_handler(state)
-# draw_status_bar(state, force=True)
-
-while True:
-    try:
-        # draw_status_bar(state, force=True)
-        user_input = prompt_session.prompt(HTML('<ansigreen><b>USER: </b></ansigreen>'), multiline=False).strip()
-    except KeyboardInterrupt:
-        continue
-    except EOFError:
-        console.print('Goodbye!')
-        break
-
-    if user_input.lower() in ['exit', 'quit']:
-        console.print('Goodbye!')
-        break
-
-    if user_input.startswith('/'):
-        result = handle_command(user_input, state)
-        # draw_status_bar(state, force=True)
-        if result == 'handled':
-            continue
-        elif result is None:
-            console.print(f'[bold red]Unknown command: {user_input}[/bold red]')
-            continue
-    else:
-        state.messages.append({'role': 'user', 'content': user_input})
-
+    enable_status_bar()
+    atexit.register(disable_status_bar)
+    install_resize_handler(state)
     # draw_status_bar(state, force=True)
 
-    # Prefer an LLM-generated summary over a blind trim once history gets
-    # large, it preserves the gist instead of just dropping old messages.
-    if total_history_tokens(state) > AUTO_SUMMARY_TOKEN_THRESHOLD:
-        console.print('[dim]Context getting large, auto-summarizing...[/dim]')
-        log_event("AUTO-SUMMARY triggered")
-        do_summary_and_compact(state)
-    else:
+    while True:
+        try:
+            user_input = prompt_session.prompt(HTML('<ansigreen><b>USER: </b></ansigreen>'), multiline=False).strip()
+        except KeyboardInterrupt:
+            continue
+        except EOFError:
+            console.print('Goodbye!')
+            break
+
+        if user_input.lower() in ['exit', 'quit']:
+            console.print('Goodbye!')
+            break
+
+        if user_input.startswith('/'):
+            result = handle_command(user_input, state)
+            if result == 'handled':
+                continue
+            elif result is None:
+                console.print(f'[bold red]Unknown command: {user_input}[/bold red]')
+                continue
+        else:
+            state.messages.append({'role': 'user', 'content': user_input})
+
+        if total_history_tokens(state) > AUTO_SUMMARY_TOKEN_THRESHOLD:
+            console.print('[dim]Context getting large, auto-summarizing...[/dim]')
+            log_event("AUTO-SUMMARY triggered")
+            do_summary_and_compact(state)
+        else:
+            trim_history(state)
+
+        try:
+            for _ in range(MAX_ITERATIONS):
+                final_text, tool_calls, finish_reason = stream_agent_response(state.messages, TOOLS)
+
+                if tool_calls:
+                    state.messages.append({
+                        "role": "assistant",
+                        "content": final_text or None,
+                        "tool_calls": [
+                            {
+                                "id": tc['id'],
+                                "type": "function",
+                                "function": {
+                                    "name": tc['name'],
+                                    "arguments": tc['arguments']
+                                }
+                            }
+                            for tc in tool_calls
+                        ]
+                    })
+
+                    for tool_call in tool_calls:
+                        name = tool_call['name']
+                        try:
+                            args = json.loads(tool_call['arguments'] or '{}')
+                        except json.JSONDecodeError as e:
+                            result = f"Error: could not parse arguments for '{name}': {e}. Re-issue the call with valid JSON."
+                        else:
+                            result = dispatch_tool(name, args, state)
+
+                        state.messages.append({
+                            'role': 'tool',
+                            'tool_call_id': tool_call['id'],
+                            'content': truncate_output(str(result))
+                        })
+                    trim_history(state)
+                    continue
+
+                final_text = final_text.strip()
+                final_text = remove_thoughts(final_text)
+                state.messages.append({'role': 'assistant', 'content': final_text})
+                if state.telegram_enabled and state.telegram_chat_id and final_text:
+                    if not send_telegram_message(final_text, state.telegram_chat_id):
+                        console.print('[dim red]Could not deliver message to Telegram (see bardgent.log).[/dim red]')
+                break
+            else:
+                console.print(f'[bold red]Hit max iterations ({MAX_ITERATIONS}) without a final answer.[/bold red]')
+
+        except KeyboardInterrupt:
+            console.print('\n[yellow]Interrupted! back to prompt.[/yellow]')
+        except Exception as e:
+            console.print(f'\n[bold red]Error during turn: {type(e).__name__}: {e}[/bold red]')
+            log_event(f"TURN ERROR: {type(e).__name__}: {e}")
+
+        if state.messages[1:]:
+            save_session(state)
         trim_history(state)
 
-    # draw_status_bar(state, force=True)
-
-    try:
-        for _ in range(MAX_ITERATIONS):
-            final_text, tool_calls, finish_reason = stream_agent_response(state.messages, TOOLS)
-
-            if tool_calls:
-                state.messages.append({
-                    "role": "assistant",
-                    "content": final_text or None,
-                    "tool_calls": [
-                        {
-                            "id": tc['id'],
-                            "type": "function",
-                            "function": {
-                                "name": tc['name'],
-                                "arguments": tc['arguments']
-                            }
-                        }
-                        for tc in tool_calls
-                    ]
-                })
-                # draw_status_bar(state, force=True)
-
-                for tool_call in tool_calls:
-                    name = tool_call['name']
-                    try:
-                        args = json.loads(tool_call['arguments'] or '{}')
-                    except json.JSONDecodeError as e:
-                        result = f"Error: could not parse arguments for '{name}': {e}. Re-issue the call with valid JSON."
-                    else:
-                        result = dispatch_tool(name, args, state)
-
-                    state.messages.append({
-                        'role': 'tool',
-                        'tool_call_id': tool_call['id'],
-                        'content': truncate_output(str(result))
-                    })
-                    # draw_status_bar(state, force=True)
-                trim_history(state)
-                # draw_status_bar(state, force=True)
-                continue
-
-            final_text = final_text.strip()
-            final_text = remove_thoughts(final_text)
-            state.messages.append({'role': 'assistant', 'content': final_text})
-            # draw_status_bar(state, force=True)
-            if state.telegram_enabled and state.telegram_chat_id and final_text:
-                if not send_telegram_message(final_text, state.telegram_chat_id):
-                    console.print('[dim red]Could not deliver message to Telegram (see bardgent.log).[/dim red]')
-            break
-        else:
-            console.print(f'[bold red]Hit max iterations ({MAX_ITERATIONS}) without a final answer.[/bold red]')
-
-    except KeyboardInterrupt:
-        console.print('\n[yellow]Interrupted! back to prompt.[/yellow]')
-    except Exception as e:
-        console.print(f'\n[bold red]Error during turn: {type(e).__name__}: {e}[/bold red]')
-        log_event(f"TURN ERROR: {type(e).__name__}: {e}")
-
-    if state.messages[1:]:
-        save_session(state)
-    trim_history(state)
-    # draw_status_bar(state, force=True)
+if __name__ == '__main__':
+    main()
