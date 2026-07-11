@@ -11,7 +11,14 @@ from pathlib import Path
 from urllib.parse import urlparse, parse_qs
 import requests
 from bs4 import BeautifulSoup
-from openai import OpenAI
+from openai import (
+    OpenAI,
+    APIError,
+    APIConnectionError,
+    APITimeoutError,
+    RateLimitError,
+    InternalServerError,
+)
 from rich.console import Console, Group
 from rich.panel import Panel
 from rich.text import Text
@@ -27,6 +34,9 @@ import re
 import difflib
 import subprocess
 import datetime
+import shutil
+import atexit
+import signal
 from dotenv import load_dotenv
 
 load_dotenv()
@@ -52,6 +62,13 @@ BASH_TIMEOUT_SECONDS = 60
 RESPONSE_TOKEN_RESERVE = 8_192        # tokens guaranteed free for the model's own reply
 MAX_HISTORY_TOKENS = 180_000           # rough budget for kept history
 AUTO_SUMMARY_TOKEN_THRESHOLD = 140_000  # auto-compact via LLM summary above this
+
+# Retry schedule for transient API failures (500s, connection drops, rate
+# limits, timeouts). Delays escalate then cap, giving the backend room to
+# recover without hammering it or waiting forever.
+MODEL_MAX_RETRIES = 10
+MODEL_RETRY_DELAYS = [3, 5, 8, 13, 21, 30, 45, 60, 60, 60]
+RETRYABLE_ERRORS = (APIError, APIConnectionError, APITimeoutError, RateLimitError, InternalServerError)
 
 MEMORY_FILE = Path('Bardgent.md')
 SESSION_DIR = Path.cwd() / ".bardgent_sessions"
@@ -788,6 +805,7 @@ def do_summary_and_compact(state):
 
     save_session(state)
     console.print(Panel(summary_text, title='[bold cyan]SUMMARY (history compacted)', border_style='cyan'))
+    draw_status_bar(state)
 
 
 def handle_command(user_input, state):
@@ -820,10 +838,12 @@ def handle_command(user_input, state):
         console.clear()
         print_welcome()
         console.print('[bold green]New session started.[/bold green]')
+        draw_status_bar(state)
         return 'handled'
 
     if cmd == '/resume':
         resume_session(state)
+        draw_status_bar(state)
         return 'handled'
 
     if cmd == '/exit':
@@ -1011,6 +1031,29 @@ def render_agent(text):
 
 
 def stream_agent_response(messages, tools):
+    """Retry wrapper around _stream_agent_response_once(). Retries on
+    transient API errors (500s, timeouts, connection drops, rate limits)
+    up to MODEL_MAX_RETRIES times, waiting according to MODEL_RETRY_DELAYS
+    between attempts. Anything else (bad args, programming errors) is not
+    retried and propagates immediately."""
+    for attempt in range(1, MODEL_MAX_RETRIES + 1):
+        try:
+            return _stream_agent_response_once(messages, tools)
+        except RETRYABLE_ERRORS as e:
+            log_event(f"MODEL CALL FAILED (attempt {attempt}/{MODEL_MAX_RETRIES}): {type(e).__name__}: {e}")
+            if attempt == MODEL_MAX_RETRIES:
+                console.print(f"[bold red]Giving up after {MODEL_MAX_RETRIES} attempts: {type(e).__name__}: {e}[/bold red]")
+                raise
+            delay = MODEL_RETRY_DELAYS[min(attempt - 1, len(MODEL_RETRY_DELAYS) - 1)]
+            console.print(
+                f"[bold red]API error (attempt {attempt}/{MODEL_MAX_RETRIES}): "
+                f"{type(e).__name__}: {e}[/bold red]\n"
+                f"[yellow]Retrying in {delay}s...[/yellow]"
+            )
+            time.sleep(delay)
+
+
+def _stream_agent_response_once(messages, tools):
     """
     Calls the model with stream=True and renders the reply live:
       - Shows a spinner ("Thinking...") until the first chunk arrives.
@@ -1048,7 +1091,10 @@ def stream_agent_response(messages, tools):
 
     spinner = Spinner('dots', text=Text(' Thinking...', style='cyan'))
 
+    status_state = _current_state_for_resize[0]
+
     with Live(spinner, console=console, refresh_per_second=12, transient=False) as live:
+        draw_status_bar(status_state)
         for chunk in stream:
             if getattr(chunk, 'usage', None):
                 usage = chunk.usage
@@ -1091,8 +1137,14 @@ def stream_agent_response(messages, tools):
                     live.update(Text(f'⚙ TOOL: {names}', style='dim cyan'))
                     has_output = True
 
+            # Keep the pinned bottom bar repainted on every streamed chunk —
+            # Live's own repaint can otherwise leave it looking stale while
+            # tokens are actively streaming in.
+            draw_status_bar(status_state)
+
         if not has_output:
             live.update(Text(''))
+        draw_status_bar(status_state)
 
     # print_usage(usage)
 
@@ -1197,14 +1249,148 @@ def run_subagent(task_prompt, max_iters=15):
     log_event("SUBAGENT HIT MAX ITERATIONS")
     return "(sub-agent hit max iterations without finishing)"
 
+
+# ---------------------------------------------------------------------------
+# Bottom-of-terminal context usage bar (Claude Code style)
+#
+# Works by shrinking the terminal's scroll region to leave the very last row
+# free, then repeatedly repainting that last row in place (save cursor ->
+# jump to last row -> clear it -> draw the bar -> restore cursor) every time
+# something meaningful happens (a reply streams in, a tool runs, history is
+# trimmed/summarized, etc). Everything else in the app keeps behaving
+# exactly as before and simply scrolls above that reserved row.
+# ---------------------------------------------------------------------------
+
+CONTEXT_WINDOW_TOKENS = 256_000
+_status_bar_enabled = False
+
+
+def _term_size():
+    size = shutil.get_terminal_size(fallback=(80, 24))
+    return size.columns, size.lines
+
+
+def enable_status_bar():
+    """Reserve the last terminal row for the status bar."""
+    global _status_bar_enabled
+    if not sys.stdout.isatty():
+        return
+    cols, rows = _term_size()
+    if rows < 3:
+        return
+    sys.stdout.write(f"\x1b[1;{rows - 1}r")   # scroll region = rows 1..rows-1
+    sys.stdout.write(f"\x1b[{rows - 1};1H")   # park cursor at bottom of region
+    sys.stdout.flush()
+    _status_bar_enabled = True
+
+
+def disable_status_bar():
+    """Restore full-screen scrolling and clear the reserved row. Safe to call
+    multiple times (e.g. once at exit, once on Ctrl-C)."""
+    global _status_bar_enabled
+    if not _status_bar_enabled or not sys.stdout.isatty():
+        return
+    cols, rows = _term_size()
+    sys.stdout.write("\x1b[r")                # reset scroll region to full screen
+    sys.stdout.write(f"\x1b[{rows};1H")
+    sys.stdout.write("\x1b[2K")
+    sys.stdout.flush()
+    _status_bar_enabled = False
+
+
+def context_usage_tokens(state):
+    """Best-effort estimate of tokens currently occupying the model's context
+    window: system prompt + full running history."""
+    used = count_tokens(state.messages[0].get('content', '')) if state.messages else 0
+    used += total_history_tokens(state)
+    return used
+
+
+def _bar_color(pct):
+    if pct < 0.5:
+        return '32'   # green
+    if pct < 0.8:
+        return '33'   # yellow
+    return '31'       # red
+
+
+def format_status_bar(state, width):
+    used = context_usage_tokens(state)
+    pct = min(used / CONTEXT_WINDOW_TOKENS, 1.0)
+    color = _bar_color(pct)
+
+    label = f" Context: "
+    stats = f" {used:,}/{CONTEXT_WINDOW_TOKENS:,} tokens ({pct * 100:.1f}%) "
+    model_tag = f" model:{MODEL} "
+
+    bar_width = max(10, min(30, width - len(label) - len(stats) - len(model_tag) - 4))
+    filled = int(bar_width * pct)
+    bar = '█' * filled + '░' * (bar_width - filled)
+
+    line = f"\x1b[{color}m{label}[{bar}]{stats}\x1b[2m|{model_tag}\x1b[0m"
+    # Strip to visible width so we never wrap onto the next (reserved) row.
+    visible_len = len(label) + 1 + bar_width + 1 + len(stats) + 1 + len(model_tag)
+    if visible_len > width:
+        # Fall back to a plain, guaranteed-short line if the terminal is tiny.
+        line = f"\x1b[{color}m Context: {used:,}/{CONTEXT_WINDOW_TOKENS:,} ({pct * 100:.0f}%) \x1b[0m"
+    return line
+
+
+def draw_status_bar(state):
+    """Repaint the reserved bottom row without disturbing the cursor position
+    the rest of the app is using."""
+    if not _status_bar_enabled or not sys.stdout.isatty():
+        return
+    cols, rows = _term_size()
+    if rows < 3:
+        return
+    bar_text = format_status_bar(state, cols)
+    sys.stdout.write("\x1b7")                 # save cursor
+    sys.stdout.write(f"\x1b[{rows};1H")       # jump to last row
+    sys.stdout.write("\x1b[2K")               # clear it
+    sys.stdout.write(bar_text)
+    sys.stdout.write("\x1b8")                 # restore cursor
+    sys.stdout.flush()
+
+
+def _handle_resize(signum, frame):
+    """On SIGWINCH: re-establish the scroll region for the new size and redraw."""
+    if not _status_bar_enabled:
+        return
+    cols, rows = _term_size()
+    if rows < 3:
+        return
+    sys.stdout.write(f"\x1b[1;{rows - 1}r")
+    sys.stdout.flush()
+    draw_status_bar(_current_state_for_resize[0])
+
+
+_current_state_for_resize = [None]  # small mutable box so the signal handler can see current state
+
+
+def install_resize_handler(state):
+    _current_state_for_resize[0] = state
+    if hasattr(signal, 'SIGWINCH'):
+        try:
+            signal.signal(signal.SIGWINCH, _handle_resize)
+        except (ValueError, OSError):
+            pass  # not the main thread, or platform doesn't support it
+
+
 print_welcome()
 log_event("=== Bardgent session start ===")
 
 prompt_session = PromptSession(completer=WordCompleter(list(COMMANDS.keys()), sentence=True))
 state = AgentState(SYSTEM_PROMPT, name='main')
 
+enable_status_bar()
+atexit.register(disable_status_bar)
+install_resize_handler(state)
+draw_status_bar(state)
+
 while True:
     try:
+        draw_status_bar(state)
         user_input = prompt_session.prompt(HTML('<ansigreen><b>USER: </b></ansigreen>'), multiline=False).strip()
     except KeyboardInterrupt:
         continue
@@ -1218,6 +1404,7 @@ while True:
 
     if user_input.startswith('/'):
         result = handle_command(user_input, state)
+        draw_status_bar(state)
         if result == 'handled':
             continue
         elif result is None:
@@ -1225,6 +1412,8 @@ while True:
             continue
     else:
         state.messages.append({'role': 'user', 'content': user_input})
+
+    draw_status_bar(state)
 
     # Prefer an LLM-generated summary over a blind trim once history gets
     # large — it preserves the gist instead of just dropping old messages.
@@ -1234,6 +1423,8 @@ while True:
         do_summary_and_compact(state)
     else:
         trim_history(state)
+
+    draw_status_bar(state)
 
     try:
         for _ in range(MAX_ITERATIONS):
@@ -1255,6 +1446,7 @@ while True:
                         for tc in tool_calls
                     ]
                 })
+                draw_status_bar(state)
 
                 for tool_call in tool_calls:
                     name = tool_call['name']
@@ -1270,12 +1462,15 @@ while True:
                         'tool_call_id': tool_call['id'],
                         'content': truncate_output(str(result))
                     })
+                    draw_status_bar(state)
                 trim_history(state)
+                draw_status_bar(state)
                 continue
 
             final_text = final_text.strip()
             final_text = remove_thoughts(final_text)
             state.messages.append({'role': 'assistant', 'content': final_text})
+            draw_status_bar(state)
             if state.telegram_enabled and state.telegram_chat_id and final_text:
                 if not send_telegram_message(final_text, state.telegram_chat_id):
                     console.print('[dim red]Could not deliver message to Telegram (see bardgent.log).[/dim red]')
@@ -1292,3 +1487,4 @@ while True:
     if state.messages[1:]:
         save_session(state)
     trim_history(state)
+    draw_status_bar(state)
