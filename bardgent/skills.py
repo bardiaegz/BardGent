@@ -42,6 +42,7 @@ can override a user override a bundled default of the same name:
 """
 
 from pathlib import Path
+from urllib.parse import urlparse
 
 from bardgent import config
 
@@ -155,3 +156,91 @@ def list_skills_text(registry=None):
     for name, info in sorted(registry.items()):
         lines.append(f"  {name} - {info['description']}  (folder: {info['dir']})")
     return '\n'.join(lines)
+
+
+def install_skill_from_github(github_url: str) -> str:
+    """Install a skill from a GitHub repository.
+    
+    Args:
+        github_url: GitHub repository URL (e.g., https://github.com/alirezarezvani/claude-skills)
+    
+    Returns:
+        Status message string
+    """
+    import subprocess
+    import tempfile
+    import shutil
+    from urllib.parse import urlparse
+    
+    # Parse the GitHub URL
+    parsed = urlparse(github_url)
+    if parsed.netloc != 'github.com':
+        return f"[bold red]Error:[/bold red] Only GitHub URLs are supported (got {parsed.netloc})"
+    
+    path_parts = parsed.path.strip('/').split('/')
+    if len(path_parts) < 2:
+        return "[bold red]Error:[/bold red] Invalid GitHub URL format. Expected: https://github.com/owner/repo"
+    
+    owner, repo = path_parts[0], path_parts[1]
+    
+    # Determine target directory (user-global skills directory)
+    target_dir = config.GLOBAL_DIR / "skills"
+    target_dir.mkdir(parents=True, exist_ok=True)
+    
+    # Clone to a temporary directory
+    with tempfile.TemporaryDirectory() as tmpdir:
+        repo_path = Path(tmpdir) / repo
+        try:
+            # Clone the repository
+            result = subprocess.run(
+                ['git', 'clone', '--depth', '1', github_url, str(repo_path)],
+                capture_output=True,
+                text=True,
+                timeout=60
+            )
+            if result.returncode != 0:
+                return f"[bold red]Error cloning repository:[/bold red] {result.stderr.strip()}"
+            
+            # Find all skill directories (directories containing SKILL.md) - recursively
+            skill_dirs = []
+            for skill_md in repo_path.rglob("SKILL.md"):
+                skill_dirs.append(skill_md.parent)
+            
+            if not skill_dirs:
+                return "[bold yellow]No skills found in repository (no directories with SKILL.md found).[/bold yellow]"
+            
+            installed = []
+            skipped = []
+            
+            for skill_dir in skill_dirs:
+                skill_name = skill_dir.name
+                target_skill_dir = target_dir / skill_name
+                
+                if target_skill_dir.exists():
+                    skipped.append(skill_name)
+                    continue
+                
+                # Copy the skill directory
+                shutil.copytree(skill_dir, target_skill_dir)
+                installed.append(skill_name)
+            
+            # Refresh the skills registry
+            refresh_skills()
+            
+            # Build result message
+            lines = []
+            if installed:
+                lines.append(f"[bold green]Installed {len(installed)} skill(s):[/bold green]")
+                for name in installed:
+                    lines.append(f"  [green]✓[/green] {name}")
+            if skipped:
+                lines.append(f"[yellow]Skipped {len(skipped)} already installed:[/yellow]")
+                for name in skipped:
+                    lines.append(f"  [yellow]⊘[/yellow] {name} (already exists)")
+            
+            return '\n'.join(lines)
+            
+        except subprocess.TimeoutExpired:
+            return "[bold red]Error:[/bold red] Git clone timed out (60s timeout)"
+        except Exception as e:
+            return f"[bold red]Error:[/bold red] {str(e)}"

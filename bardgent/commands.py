@@ -11,6 +11,7 @@ from bardgent.session import (
 )
 from bardgent.checkpoints import list_checkpoints, restore_checkpoint
 from bardgent.telegram import discover_telegram_chat_id, send_telegram_message, _save_telegram_chat_id
+from bardgent.skills import install_skill_from_github
 
 COMMANDS = {
     '/summary': 'Summarize the current conversation',
@@ -23,6 +24,7 @@ COMMANDS = {
     '/auto': 'Switch to AUTO mode (auto-approve everything except dangerous commands)',
     '/mode': 'Show the current mode',
     '/skills': 'List installed skills (auto-detected capability packs)',
+    '/skill install': 'Install a skill from GitHub: /skill install <github_url>',
     '/checkpoints': 'List recent git checkpoints (auto-created on Write/Edit)',
     '/restore': 'Restore the working tree to a checkpoint: /restore <n>',
     '/exit': 'Quit Bardgent',
@@ -151,6 +153,20 @@ def handle_command(user_input, state):
         state.telegram_enabled = True
         console.print('[bold green]Telegram messaging turned on, final answers will be sent there too.[/bold green]')
         log_event("TELEGRAM enabled")
+        return 'handled'
+
+    if cmd == '/skill install' or cmd.startswith('/skill install '):
+        parts = user_input.strip().split(maxsplit=2)
+        if len(parts) < 3:
+            console.print('[yellow]Usage: /skill install <github_url>[/yellow]')
+            console.print('[dim]Example: /skill install https://github.com/alirezarezvani/claude-skills[/dim]')
+            return 'handled'
+        
+        github_url = parts[2].strip()
+        console.print(f'[cyan]Installing skill from {github_url}...[/cyan]')
+        result = install_skill_from_github(github_url)
+        console.print(result)
+        skills.refresh_skills()
         return 'handled'
 
     return None

@@ -38,7 +38,7 @@ client = OpenAI(
 
 MODEL = 'nvidia/nemotron-3-ultra-550b-a55b'
 TEMPERATURE = 0.2
-MAX_ITERATIONS = 30
+MAX_ITERATIONS = 100
 # Tool loops produce 2 messages per call (assistant tool_calls + tool result).
 # 30 was far too low and mid-turn trims wiped the whole conversation.
 MAX_HISTORY_MESSAGES = 120
