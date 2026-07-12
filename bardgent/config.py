@@ -32,11 +32,11 @@ working_directory = os.getcwd()
 home_directory = os.path.expanduser('~')
 
 client = OpenAI(
-    base_url='https://generativelanguage.googleapis.com/v1beta/openai/',
+    base_url='https://integrate.api.nvidia.com/v1',
     api_key=os.environ.get('GEMINI_API_KEY', '')
 )
 
-MODEL = 'gemma-4-31b-it'
+MODEL = 'nvidia/nemotron-3-ultra-550b-a55b'
 TEMPERATURE = 0.2
 MAX_ITERATIONS = 30
 # Tool loops produce 2 messages per call (assistant tool_calls + tool result).
