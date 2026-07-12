@@ -46,6 +46,14 @@ MAX_HISTORY_MESSAGES = 120
 MIN_HISTORY_MESSAGES = 6
 MAX_TOOL_OUTPUT = 24_000
 BASH_TIMEOUT_SECONDS = 60
+# Default wait when the model calls Await() without a timeout.
+BASH_AWAIT_DEFAULT_SECONDS = 30
+# Hard cap on Await waits so a hung process cannot block the agent forever.
+BASH_AWAIT_MAX_SECONDS = 600
+# Default Read() window when limit is omitted but offset is set, and max lines
+# returned in one Read call to keep tool results manageable.
+READ_DEFAULT_LIMIT = 2_000
+READ_MAX_LIMIT = 5_000
 RESPONSE_TOKEN_RESERVE = 8_192
 MAX_HISTORY_TOKENS = 180_000
 AUTO_SUMMARY_TOKEN_THRESHOLD = 140_000
@@ -83,7 +91,15 @@ NON_RETRYABLE_ERRORS = (
 # Modes: plan / normal / auto (Claude Code style)
 # ---------------------------------------------------------------------------
 VALID_MODES = ('plan', 'normal', 'auto')
-READONLY_TOOLS = {'Read', 'Glob', 'Grep', 'WebSearch', 'Fetch', 'read_memory', 'list_memory', 'Skill', 'list_skills'}
+READONLY_TOOLS = {
+    'Read', 'Glob', 'Grep', 'WebSearch', 'Fetch',
+    'read_memory', 'list_memory', 'Skill', 'list_skills',
+    # Observe background jobs without mutating the project.
+    'ListJobs', 'Await',
+}
+
+# Background job log files live under the global config dir.
+JOBS_DIR = GLOBAL_DIR / 'jobs' if False else None  # set below after GLOBAL_DIR
 
 # ---------------------------------------------------------------------------
 # Directories
