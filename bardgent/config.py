@@ -39,7 +39,11 @@ client = OpenAI(
 MODEL = 'gemma-4-31b-it'
 TEMPERATURE = 0.2
 MAX_ITERATIONS = 30
-MAX_HISTORY_MESSAGES = 30
+# Tool loops produce 2 messages per call (assistant tool_calls + tool result).
+# 30 was far too low and mid-turn trims wiped the whole conversation.
+MAX_HISTORY_MESSAGES = 120
+# Always keep at least this many non-system messages after a trim.
+MIN_HISTORY_MESSAGES = 6
 MAX_TOOL_OUTPUT = 24_000
 BASH_TIMEOUT_SECONDS = 60
 RESPONSE_TOKEN_RESERVE = 8_192
@@ -57,9 +61,23 @@ from openai import (  # noqa: E402  (kept together with the retry schedule above
     APITimeoutError,
     RateLimitError,
     InternalServerError,
+    BadRequestError,
+    AuthenticationError,
+    PermissionDeniedError,
+    NotFoundError,
+    UnprocessableEntityError,
 )
 
-RETRYABLE_ERRORS = (APIError, APIConnectionError, APITimeoutError, RateLimitError, InternalServerError)
+# Transient / server-side only. 4xx client errors (bad history, bad schema,
+# auth, etc.) must not be retried — they will fail the same way every time.
+RETRYABLE_ERRORS = (APIConnectionError, APITimeoutError, RateLimitError, InternalServerError)
+NON_RETRYABLE_ERRORS = (
+    BadRequestError,
+    AuthenticationError,
+    PermissionDeniedError,
+    NotFoundError,
+    UnprocessableEntityError,
+)
 
 # ---------------------------------------------------------------------------
 # Modes: plan / normal / auto (Claude Code style)

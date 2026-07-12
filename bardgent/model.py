@@ -26,23 +26,53 @@ def print_usage(usage):
     console.print(f'[dim]tokens: {in_tok} in / {out_tok} out[/dim]')
 
 
+import traceback
+
 def stream_agent_response(messages, tools):
     """Retry wrapper around _stream_agent_response_once()."""
     for attempt in range(1, config.MODEL_MAX_RETRIES + 1):
         try:
             return _stream_agent_response_once(messages, tools)
-        except config.RETRYABLE_ERRORS as e:
-            log_event(f"MODEL CALL FAILED (attempt {attempt}/{config.MODEL_MAX_RETRIES}): {type(e).__name__}: {e}")
-            if attempt == config.MODEL_MAX_RETRIES:
-                console.print(f"[bold red]Giving up after {config.MODEL_MAX_RETRIES} attempts: {type(e).__name__}: {e}[/bold red]")
-                raise
-            delay = config.MODEL_RETRY_DELAYS[min(attempt - 1, len(config.MODEL_RETRY_DELAYS) - 1)]
+
+        except config.NON_RETRYABLE_ERRORS as e:
+            error_detail = f"{type(e).__name__}: {e}"
+            log_event(f"MODEL CALL FAILED (non-retryable):\n{error_detail}\n{traceback.format_exc()}")
             console.print(
-                f"[bold red]API error (attempt {attempt}/{config.MODEL_MAX_RETRIES})[/bold red]\n "
+                f"[bold red]API error (not retried):[/bold red] "
+                f"[yellow]{error_detail}[/yellow]"
+            )
+            raise
+
+        except config.RETRYABLE_ERRORS as e:
+            error_detail = (
+                f"{type(e).__name__}: {e}\n"
+                f"repr: {repr(e)}\n"
+                f"traceback:\n{traceback.format_exc()}"
+            )
+
+            log_event(
+                f"MODEL CALL FAILED (attempt {attempt}/{config.MODEL_MAX_RETRIES}):\n"
+                f"{error_detail}"
+            )
+
+            if attempt == config.MODEL_MAX_RETRIES:
+                console.print(
+                    f"[bold red]Giving up after {config.MODEL_MAX_RETRIES} attempts[/bold red]\n"
+                    f"[red]{error_detail}[/red]"
+                )
+                raise
+
+            delay = config.MODEL_RETRY_DELAYS[
+                min(attempt - 1, len(config.MODEL_RETRY_DELAYS) - 1)
+            ]
+
+            console.print(
+                f"[bold red]API error (attempt {attempt}/{config.MODEL_MAX_RETRIES})[/bold red]\n"
+                f"[yellow]{type(e).__name__}: {e}[/yellow]\n"
                 f"[yellow]Retrying in {delay}s...[/yellow]"
             )
-            time.sleep(delay)
 
+            time.sleep(delay)
 
 def _stream_agent_response_once(messages, tools):
     """
@@ -55,6 +85,16 @@ def _stream_agent_response_once(messages, tools):
 
     Returns: (final_text, tool_calls, finish_reason)
     """
+    # Guard: Gemini rejects system-only payloads with
+    # "GenerateContentRequest.contents: contents is not specified".
+    non_system = [m for m in messages if m.get('role') != 'system']
+    if not non_system:
+        raise ValueError(
+            "Refusing model call with empty conversation history "
+            "(only system message). This usually means trim/sanitize wiped "
+            "the user turn — try /clear and resend."
+        )
+
     stream = config.client.chat.completions.create(
         model=config.MODEL,
         messages=messages,
@@ -126,6 +166,12 @@ def _stream_agent_response_once(messages, tools):
 
 def _call_model_once(messages, tools):
     """Blocking, non-streaming model call. Used by concurrently-run sub-agents."""
+    non_system = [m for m in messages if m.get('role') != 'system']
+    if not non_system:
+        raise ValueError(
+            "Refusing model call with empty conversation history "
+            "(only system message)."
+        )
     response = config.client.chat.completions.create(
         model=config.MODEL,
         messages=messages,
@@ -148,6 +194,9 @@ def call_model(messages, tools):
     for attempt in range(1, config.MODEL_MAX_RETRIES + 1):
         try:
             return _call_model_once(messages, tools)
+        except config.NON_RETRYABLE_ERRORS as e:
+            log_event(f"MODEL CALL (non-stream) FAILED (non-retryable): {type(e).__name__}: {e}")
+            raise
         except config.RETRYABLE_ERRORS as e:
             log_event(f"MODEL CALL (non-stream) FAILED (attempt {attempt}/{config.MODEL_MAX_RETRIES}): {type(e).__name__}: {e}")
             if attempt == config.MODEL_MAX_RETRIES:

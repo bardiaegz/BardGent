@@ -15,7 +15,6 @@ from rich.markup import escape
 from bardgent import config
 from bardgent.config import console, console_lock, log_event
 from bardgent.state import AgentState
-from bardgent.session import trim_history
 from bardgent.utils import truncate_output
 from bardgent.model import stream_agent_response, call_model
 
@@ -67,9 +66,13 @@ def run_subagent(task_prompt, max_iters=15, render=True, label=None):
             log_event(f"SUBAGENT {tag}DONE")
             return result
 
+        for n, tc in enumerate(tool_calls):
+            if not tc.get('id'):
+                tc['id'] = f'call_{n}_{abs(hash(tc.get("name") or "")) % 10**8:08d}'
+
         sub_state.messages.append({
             "role": "assistant",
-            "content": final_text or None,
+            "content": final_text or '',
             "tool_calls": [
                 {"id": tc['id'], "type": "function",
                  "function": {"name": tc['name'], "arguments": tc['arguments']}}
@@ -89,9 +92,9 @@ def run_subagent(task_prompt, max_iters=15, render=True, label=None):
                         result = dispatch_tool(tc['name'], args, sub_state)
             sub_state.messages.append({
                 'role': 'tool', 'tool_call_id': tc['id'],
-                'content': truncate_output(str(result)),
+                'content': truncate_output(str(result)) or '(no output)',
             })
-        trim_history(sub_state)
+        # Avoid mid-loop trim (same Gemini empty-contents failure mode as main).
 
     log_event(f"SUBAGENT {tag}HIT MAX ITERATIONS")
     return "(sub-agent hit max iterations without finishing)"

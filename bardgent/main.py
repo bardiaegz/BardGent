@@ -20,7 +20,10 @@ from bardgent.ui import print_welcome
 from bardgent.state import AgentState
 from bardgent.system_prompt import SYSTEM_PROMPT
 from bardgent.commands import COMMANDS, handle_command, switch_mode, MODE_CYCLE
-from bardgent.session import save_session, trim_history, total_history_tokens, do_summary_and_compact
+from bardgent.session import (
+    save_session, trim_history, total_history_tokens,
+    do_summary_and_compact, sanitize_history,
+)
 from bardgent.model import stream_agent_response
 from bardgent.tool_schemas import TOOLS, dispatch_tool
 from bardgent.utils import truncate_output
@@ -99,15 +102,24 @@ def main():
         else:
             trim_history(state)
 
+        # Always re-validate before the model call (resume/trim/failed retries
+        # can leave Gemini-invalid turn order in the history).
+        sanitize_history(state)
+
         try:
             plan_completed_successfully = False
             for _ in range(config.MAX_ITERATIONS):
                 final_text, tool_calls, finish_reason = stream_agent_response(state.messages, TOOLS)
 
                 if tool_calls:
+                    # Guarantee ids — some Gemini streams omit them on deltas.
+                    for n, tc in enumerate(tool_calls):
+                        if not tc.get('id'):
+                            tc['id'] = f'call_{n}_{abs(hash(tc.get("name") or "")) % 10**8:08d}'
+
                     state.messages.append({
                         "role": "assistant",
-                        "content": final_text or None,
+                        "content": final_text or '',
                         "tool_calls": [
                             {
                                 "id": tc['id'],
@@ -133,9 +145,11 @@ def main():
                         state.messages.append({
                             'role': 'tool',
                             'tool_call_id': tool_call['id'],
-                            'content': truncate_output(str(result))
+                            'content': truncate_output(str(result)) or '(no output)',
                         })
-                    trim_history(state)
+                    # Do NOT trim mid tool-loop: aggressive trims were wiping the
+                    # user turn and leaving system-only history (Gemini 400:
+                    # "contents is not specified"). Trimming runs at turn start.
                     continue
 
                 final_text = config.remove_thoughts(final_text.strip())
@@ -177,8 +191,11 @@ def main():
                     console.print("[dim]Remaining in PLAN mode.[/dim]")
 
         except KeyboardInterrupt:
+            # Mid-turn interrupt can leave assistant tool_calls without results.
+            sanitize_history(state)
             console.print('\n[yellow]Interrupted! back to prompt.[/yellow]')
         except Exception as e:
+            sanitize_history(state)
             console.print(f'\n[bold red]Error during turn: {type(e).__name__}: {e}[/bold red]')
             log_event(f"TURN ERROR: {type(e).__name__}: {e}")
 
