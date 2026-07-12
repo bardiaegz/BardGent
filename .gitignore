@@ -5,3 +5,9 @@ Bardgent.md
 .bardgent_sessions/
 bardgent.log
 .bardgent_telegram.json
+*.pyc
+PKG-INFO
+pyproject.toml
+__init__.py
+*.txt
+permissions.json
