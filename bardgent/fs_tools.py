@@ -6,8 +6,10 @@ import os
 import re
 import glob
 import time
+import shutil
 import difflib
 import fnmatch
+import subprocess
 from pathlib import Path
 
 from rich.text import Text
@@ -45,13 +47,72 @@ def _stale_warning(path):
     return ''
 
 
-def Read(file_path):
+def Read(file_path, offset=None, limit=None):
+    """Read a file, optionally windowed by 1-based line `offset`/`limit`.
+
+    - No offset/limit: returns the whole file, each line prefixed with its
+      1-based line number (like `cat -n`), capped at config.READ_MAX_LIMIT
+      lines total so a huge file can't blow the context window by itself.
+    - offset only: starts at that line, using config.READ_DEFAULT_LIMIT lines.
+    - offset + limit: reads exactly that window (limit still capped at
+      config.READ_MAX_LIMIT).
+
+    The "N\t" line-number prefix is display-only — never copy it into an
+    Edit() old_str/new_str.
+    """
     path = os.path.abspath(os.path.expanduser(file_path))
     warning = _stale_warning(path)
-    with open(path, 'r') as f:
-        content = f.read()
+    try:
+        with open(path, 'r', encoding='utf-8', errors='replace') as f:
+            lines = f.readlines()
+    except OSError as e:
+        return f"Error reading {path}: {e}"
+
+    total = len(lines)
+    start = max((offset - 1), 0) if offset else 0
+
+    if limit is not None:
+        window = limit
+    elif offset:
+        window = config.READ_DEFAULT_LIMIT
+    else:
+        window = total
+
+    window = min(window, config.READ_MAX_LIMIT)
+    hard_end = min(start + window, total)
+    selected = lines[start:hard_end]
+
     _record_mtime(path)
-    return content + warning
+
+    # main.py separately truncates every tool's raw output to
+    # config.MAX_TOOL_OUTPUT characters. If we let that be the thing that cuts
+    # us off, the model only sees a generic char-count truncation note with no
+    # line info, so it can't ask for the next window precisely. Instead, stop
+    # ourselves first and emit the same "pass offset=N" hint we'd use for a
+    # line-count cutoff, so behavior is identical either way.
+    budget = max(config.MAX_TOOL_OUTPUT - 200, 500)
+    out_lines = []
+    used = 0
+    end = start
+    for i, line in enumerate(selected, start + 1):
+        entry = f"{i:>6}\t{line}"
+        if not entry.endswith('\n'):
+            entry += '\n'
+        if used + len(entry) > budget and out_lines:
+            break
+        out_lines.append(entry)
+        used += len(entry)
+        end = i
+
+    numbered = ''.join(out_lines)
+
+    note = ''
+    if end < total:
+        note = f"[showing lines {start + 1}-{end} of {total} total; pass offset={end + 1} to continue]\n"
+    elif start > 0:
+        note = f"[showing lines {start + 1}-{end} of {total} total]\n"
+
+    return note + numbered + warning
 
 
 ADD_STYLE = 'white on dark_green'
@@ -125,6 +186,7 @@ def _make_backup(path, old_content):
 
 def Write(file_path, content, state):
     path = os.path.abspath(os.path.expanduser(file_path))
+    parent = os.path.dirname(path)
     old = ''
     existed = os.path.exists(path)
     if existed:
@@ -132,16 +194,23 @@ def Write(file_path, content, state):
             old = f.read()
     if not confirm_diff(old, content, path, 'Write', state):
         return f"Write to {path} rejected by user. Do NOT retry it or a variation of it, continue with what you already have, or ask the user in your final answer."
+
+    created_dirs = False
+    if parent and not os.path.isdir(parent):
+        os.makedirs(parent, exist_ok=True)
+        created_dirs = True
+
     if existed:
         _make_backup(path, old)
     with open(path, 'w') as f:
         f.write(content)
     _record_mtime(path)
-    log_event(f"[{state.name}] WRITE {path}")
+    log_event(f"[{state.name}] WRITE {path}" + (" (created parent dirs)" if created_dirs else ""))
     checkpoint = make_git_checkpoint(path, f"Write: {os.path.basename(path)}")
     checkpoint_note = f' [checkpoint {checkpoint[:10]}]' if checkpoint else ''
     suffix = ' (previous version backed up, use Undo to revert)' if existed else ''
-    return f'Wrote to {path}{suffix}{checkpoint_note}'
+    dirs_note = f' (created directory {parent})' if created_dirs else ''
+    return f'Wrote to {path}{suffix}{dirs_note}{checkpoint_note}'
 
 
 def find_fuzzy_match(content, old_str, threshold=0.6):
@@ -226,13 +295,53 @@ def Glob(pattern):
 MAX_GREP_MATCHES = 200
 SKIP_DIRS = {'__pycache__', 'node_modules', 'venv', '.venv', 'dist', 'build'}
 
+_RIPGREP_PATH = shutil.which('rg')
 
-def Grep(pattern, path='.', include=None):
+
+def _ripgrep_grep(pattern, root, include):
+    cmd = [_RIPGREP_PATH, '--line-number', '--no-heading', '--color=never', '-e', pattern]
+    if include:
+        cmd += ['-g', include]
+    cmd.append(root)
+    try:
+        result = subprocess.run(cmd, capture_output=True, text=True, timeout=30)
+    except (OSError, subprocess.SubprocessError) as e:
+        return None, f"Error running ripgrep: {type(e).__name__}: {e}"
+
+    # rg exit codes: 0 = matches found, 1 = no matches (not an error), 2+ = real error.
+    if result.returncode not in (0, 1):
+        return None, f"Error running ripgrep: {result.stderr.strip() or 'unknown error'}"
+
+    out = result.stdout.strip('\n')
+    if not out:
+        return '(no matches)', None
+
+    lines = out.split('\n')
+    truncated = len(lines) > MAX_GREP_MATCHES
+    lines = lines[:MAX_GREP_MATCHES]
+    rel_lines = []
+    for line in lines:
+        head, sep, rest = line.partition(':')
+        if sep:
+            try:
+                rel = os.path.relpath(head, root)
+            except ValueError:
+                rel = head
+            rel_lines.append(f"{rel}:{rest}")
+        else:
+            rel_lines.append(line)
+    text = '\n'.join(rel_lines)
+    if truncated:
+        text += f"\n(stopped at {MAX_GREP_MATCHES} matches)"
+    return text, None
+
+
+def _python_grep(pattern, root, include):
+    """Pure-Python fallback used when ripgrep isn't installed on the system."""
     try:
         regex = re.compile(pattern)
     except re.error as e:
         return f"Error: invalid regex: {e}"
-    root = os.path.abspath(os.path.expanduser(path))
     matches = []
     for dirpath, dirnames, filenames in os.walk(root):
         dirnames[:] = [d for d in dirnames if not d.startswith('.') and d not in SKIP_DIRS]
@@ -251,3 +360,22 @@ def Grep(pattern, path='.', include=None):
             except (UnicodeDecodeError, OSError):
                 continue
     return '\n'.join(matches) if matches else '(no matches)'
+
+
+def Grep(pattern, path='.', include=None):
+    """Search file contents for a regex pattern.
+
+    Uses the system `rg` (ripgrep) binary when available, since it's far
+    faster on large trees and already understands .gitignore; falls back to
+    a pure-Python walk (identical output format) when rg isn't installed.
+    """
+    root = os.path.abspath(os.path.expanduser(path))
+    if _RIPGREP_PATH:
+        text, err = _ripgrep_grep(pattern, root, include)
+        if err is None:
+            return text
+        # ripgrep itself failed (bad regex, missing path, etc.) - surface it
+        # rather than silently falling back, since the Python path may behave
+        # differently on regex edge cases.
+        return err
+    return _python_grep(pattern, root, include)

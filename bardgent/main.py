@@ -28,6 +28,7 @@ from bardgent.model import stream_agent_response
 from bardgent.tool_schemas import TOOLS, dispatch_tool
 from bardgent.utils import truncate_output
 from bardgent.status_bar import enable_status_bar, disable_status_bar, install_resize_handler
+from bardgent.exec_tools import cleanup_jobs
 
 
 def main():
@@ -57,6 +58,7 @@ def main():
 
     enable_status_bar()
     atexit.register(disable_status_bar)
+    atexit.register(cleanup_jobs)
     install_resize_handler(state)
 
     auto_continue = False

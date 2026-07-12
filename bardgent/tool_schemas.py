@@ -5,7 +5,7 @@ from bardgent import config, memory, skills
 from bardgent.config import log_event
 from bardgent.web_tools import WebSearch, Fetch
 from bardgent.fs_tools import Read, Write, Edit, Undo, Glob, Grep
-from bardgent.exec_tools import Bash
+from bardgent.exec_tools import Bash, ListJobs, Await
 
 TOOLS = [
     {'type': 'function', 'function': {
@@ -62,11 +62,22 @@ TOOLS = [
         }, 'required': ['query']},
     }},
     {'type': 'function', 'function': {
-        'name': 'Read', 'description': 'Read a file from disk',
-        'parameters': {'type': 'object', 'properties': {'file_path': {'type': 'string'}}, 'required': ['file_path']}
+        'name': 'Read',
+        'description': (
+            'Read a file from disk. Each returned line is prefixed with its 1-based line '
+            'number (e.g. "12\\t..."), which is display-only - never include it when building '
+            'an Edit() old_str/new_str. By default returns the whole file, capped at '
+            f'{config.READ_MAX_LIMIT} lines; use offset (and optionally limit) to page through '
+            'files larger than that.'
+        ),
+        'parameters': {'type': 'object', 'properties': {
+            'file_path': {'type': 'string'},
+            'offset': {'type': 'integer', 'description': f'1-based line number to start reading from. Defaults to line 1; when set without limit, reads {config.READ_DEFAULT_LIMIT} lines from there.'},
+            'limit': {'type': 'integer', 'description': f'max number of lines to return (capped at {config.READ_MAX_LIMIT})'},
+        }, 'required': ['file_path']}
     }},
     {'type': 'function', 'function': {
-        'name': 'Write', 'description': 'Write (overwrite) full content to a file. Backs up any existing file first.',
+        'name': 'Write', 'description': 'Write (overwrite) full content to a file. Creates missing parent directories automatically. Backs up any existing file first.',
         'parameters': {'type': 'object', 'properties': {
             'file_path': {'type': 'string', 'description': 'the path of the file to write to'},
             'content': {'type': 'string', 'description': 'the content to write to the file'}
@@ -91,7 +102,12 @@ TOOLS = [
         'parameters': {'type': 'object', 'properties': {'pattern': {'type': 'string'}}, 'required': ['pattern']}
     }},
     {'type': 'function', 'function': {
-        'name': 'Grep', 'description': 'Search file contents for a regex pattern, returns matches as path:line_number: line',
+        'name': 'Grep',
+        'description': (
+            'Search file contents for a regex pattern, returns matches as path:line_number: line. '
+            'Uses ripgrep under the hood when it is installed on the system (much faster, respects '
+            '.gitignore), and falls back to an equivalent pure-Python search otherwise.'
+        ),
         'parameters': {'type': 'object', 'properties': {
             'pattern': {'type': 'string', 'description': 'regex pattern to search for'},
             'path': {'type': 'string', 'description': 'directory to search in (default: current directory)'},
@@ -99,8 +115,36 @@ TOOLS = [
         }, 'required': ['pattern']}
     }},
     {'type': 'function', 'function': {
-        'name': 'Bash', 'description': f'Execute a shell command (killed after {config.BASH_TIMEOUT_SECONDS}s if it hangs)',
-        'parameters': {'type': 'object', 'properties': {'command': {'type': 'string', 'description': 'the command to execute'}}, 'required': ['command']}
+        'name': 'Bash',
+        'description': (
+            f'Execute a shell command (killed after {config.BASH_TIMEOUT_SECONDS}s if it hangs, '
+            'unless run in the background). For long-running or blocking commands (dev servers, '
+            'watchers, long builds/tests), set run_in_background=true: it returns a job_id '
+            'immediately instead of blocking, which you then check with Await(job_id) or '
+            'ListJobs().'
+        ),
+        'parameters': {'type': 'object', 'properties': {
+            'command': {'type': 'string', 'description': 'the command to execute'},
+            'run_in_background': {'type': 'boolean', 'description': 'if true, run asynchronously and return a job_id immediately instead of blocking'},
+            'timeout': {'type': 'integer', 'description': 'foreground-only: override the default timeout in seconds before the command is killed'},
+        }, 'required': ['command']}
+    }},
+    {'type': 'function', 'function': {
+        'name': 'ListJobs',
+        'description': 'List background jobs started via Bash(run_in_background=true), with their status (running/exited) and elapsed time.',
+        'parameters': {'type': 'object', 'properties': {}},
+    }},
+    {'type': 'function', 'function': {
+        'name': 'Await',
+        'description': (
+            'Wait for a background job (started via Bash run_in_background=true) to finish or '
+            'produce output, and return what it has written so far. Safe to call repeatedly on '
+            'a still-running job - it does not kill it.'
+        ),
+        'parameters': {'type': 'object', 'properties': {
+            'job_id': {'type': 'string', 'description': 'the job_id returned by Bash(run_in_background=true)'},
+            'timeout': {'type': 'integer', 'description': f'max seconds to wait for this call (default {config.BASH_AWAIT_DEFAULT_SECONDS}, hard-capped at {config.BASH_AWAIT_MAX_SECONDS})'},
+        }, 'required': ['job_id']}
     }},
     {'type': 'function', 'function': {
         'name': 'Task',
@@ -178,7 +222,7 @@ def dispatch_tool(name, args, state):
         elif name == 'Fetch':
             return Fetch(args['link'], state)
         elif name == 'Read':
-            return Read(args['file_path'])
+            return Read(args['file_path'], args.get('offset'), args.get('limit'))
         elif name == 'Write':
             return Write(args['file_path'], args['content'], state)
         elif name == 'Edit':
@@ -190,7 +234,15 @@ def dispatch_tool(name, args, state):
         elif name == 'Grep':
             return Grep(args['pattern'], args.get('path', '.'), args.get('include'))
         elif name == 'Bash':
-            return Bash(args['command'], state)
+            return Bash(
+                args['command'], state,
+                timeout=args.get('timeout'),
+                run_in_background=bool(args.get('run_in_background', False)),
+            )
+        elif name == 'ListJobs':
+            return ListJobs()
+        elif name == 'Await':
+            return Await(args['job_id'], args.get('timeout'))
         else:
             return 'Unknown tool'
     except Exception as e:

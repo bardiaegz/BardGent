@@ -98,9 +98,6 @@ READONLY_TOOLS = {
     'ListJobs', 'Await',
 }
 
-# Background job log files live under the global config dir.
-JOBS_DIR = GLOBAL_DIR / 'jobs' if False else None  # set below after GLOBAL_DIR
-
 # ---------------------------------------------------------------------------
 # Directories
 # ---------------------------------------------------------------------------
@@ -119,6 +116,11 @@ BACKUP_DIR.mkdir(exist_ok=True)
 last_backup = {}
 
 MEMORY_FILE = GLOBAL_DIR / 'Bardgent.md'
+
+# Background job log files (Bash run_in_background=true) live here. Must be
+# defined after GLOBAL_DIR, since it's a subdirectory of it.
+JOBS_DIR = GLOBAL_DIR / 'jobs'
+JOBS_DIR.mkdir(exist_ok=True)
 
 CHECKPOINT_REF = 'refs/bardgent/checkpoints'
 CHECKPOINT_LOG = PERMISSIONS_DIR / 'checkpoints.json'

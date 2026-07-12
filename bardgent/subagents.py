@@ -17,6 +17,20 @@ from bardgent.config import console, console_lock, log_event
 from bardgent.state import AgentState
 from bardgent.utils import truncate_output
 from bardgent.model import stream_agent_response, call_model
+from bardgent.system_prompt import build_skills_and_rules_block
+
+
+def _sub_system_prompt():
+    # Same skills catalogue + tool-usage rules as the main agent, so
+    # sub-agents follow identical conventions (Read paging, Edit fuzzy-match
+    # behaviour, background Bash jobs, when to reach for a skill, etc.)
+    # instead of a stripped-down prompt that drifts out of sync over time.
+    return (
+        "You are a focused sub-agent spawned to complete one delegated task.\n"
+        "Use the available tools as needed, then reply with ONLY the final "
+        "result, no meta-commentary about being a sub-agent.\n\n"
+        + build_skills_and_rules_block() + "\n\n" + config.SYSTEM_INFO
+    )
 
 
 def run_subagent(task_prompt, max_iters=15, render=True, label=None):
@@ -31,12 +45,7 @@ def run_subagent(task_prompt, max_iters=15, render=True, label=None):
     from bardgent.tool_schemas import dispatch_tool, SUBAGENT_TOOLS
 
     tag = f"[{label}] " if label else ''
-    sub_system_prompt = (
-        "You are a focused sub-agent spawned to complete one delegated task.\n"
-        "Use the available tools as needed, then reply with ONLY the final "
-        "result, no meta-commentary about being a sub-agent.\n\n" + config.SYSTEM_INFO
-    )
-    sub_state = AgentState(sub_system_prompt, name='sub', track_session=False, mode='auto')
+    sub_state = AgentState(_sub_system_prompt(), name='sub', track_session=False, mode='auto')
     sub_state.messages.append({'role': 'user', 'content': task_prompt})
 
     if render:
