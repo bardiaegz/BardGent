@@ -3,7 +3,7 @@
 from rich.panel import Panel
 from rich.markup import escape
 
-from bardgent import config, skills
+from bardgent import config, skills, scheduler
 from bardgent.config import console, log_event
 from bardgent.state import ask_approval
 from bardgent.session import (
@@ -12,6 +12,7 @@ from bardgent.session import (
 from bardgent.checkpoints import list_checkpoints, restore_checkpoint
 from bardgent.telegram import discover_telegram_chat_id, send_telegram_message, _save_telegram_chat_id
 from bardgent.skills import install_skill_from_github
+from bardgent.system_prompt import refresh_system_message
 
 COMMANDS = {
     '/summary': 'Summarize the current conversation',
@@ -27,11 +28,31 @@ COMMANDS = {
     '/skill install': 'Install a skill from GitHub: /skill install <github_url>',
     '/checkpoints': 'List recent git checkpoints (auto-created on Write/Edit)',
     '/restore': 'Restore the working tree to a checkpoint: /restore <n>',
+    '/schedule': 'Create a scheduled task: /schedule <spec> :: <prompt>. Manage: /schedule pause|resume|delete|run <id>',
+    '/schedules': 'List scheduled tasks (next/last run, status)',
     '/exit': 'Quit Bardgent',
 }
 
 MODE_CYCLE = ['normal', 'auto', 'plan']
 _MODE_COLOR = {'plan': 'cyan', 'normal': 'white', 'auto': 'bold red'}
+
+SCHEDULE_HELP = (
+    "Usage: /schedule <spec> :: <prompt>\n"
+    "  Specs:\n"
+    "    every 30m | every 2h | every 1d   (recurring interval, min 60s)\n"
+    "    daily 09:00 | daily 6pm            (once a day)\n"
+    "    weekly mon 09:00                   (once a week)\n"
+    "    once 2026-07-20 09:00              (a single one-off run)\n"
+    "    cron */15 * * * *                  (standard 5-field cron)\n"
+    "  Example:\n"
+    "    /schedule daily 09:00 :: Summarize my unread Slack messages from the last 24 hours\n"
+    "  Manage existing tasks:\n"
+    "    /schedules                (list all)\n"
+    "    /schedule pause <id>\n"
+    "    /schedule resume <id>\n"
+    "    /schedule delete <id>\n"
+    "    /schedule run <id>        (run it right now, on demand)"
+)
 
 
 def switch_mode(state, new_mode, announce=True):
@@ -81,6 +102,7 @@ def handle_command(user_input, state):
         from bardgent.ui import print_welcome  # local import: avoids a circular import with main.py
         del state.messages[1:]
         state.session_file = config.SESSION_DIR / session_file_name()
+        refresh_system_message(state)
         console.clear()
         print_welcome()
         console.print("[bold green]New session started.[/bold green]")
@@ -117,6 +139,59 @@ def handle_command(user_input, state):
             console.print('[yellow]Restore cancelled.[/yellow]')
             return 'handled'
         console.print(restore_checkpoint(parts[1].strip()))
+        return 'handled'
+
+    if cmd == '/schedules':
+        console.print(Panel(escape(scheduler.list_tasks_text()), title='[bold cyan]Scheduled tasks', border_style='cyan'))
+        return 'handled'
+
+    if cmd == '/schedule' or cmd.startswith('/schedule '):
+        rest = user_input.strip()[len('/schedule'):].strip()
+        if not rest:
+            console.print(Panel(SCHEDULE_HELP, title='[bold cyan]/schedule help', border_style='cyan'))
+            return 'handled'
+
+        first_word = rest.split(maxsplit=1)[0].lower()
+        if first_word in ('pause', 'resume', 'delete', 'remove', 'cancel', 'run'):
+            parts = rest.split(maxsplit=1)
+            if len(parts) < 2:
+                console.print(f'[yellow]Usage: /schedule {first_word} <id>  (see /schedules for ids)[/yellow]')
+                return 'handled'
+            task_id = parts[1].strip()
+
+            if first_word == 'pause':
+                ok = scheduler.set_enabled(task_id, False)
+                console.print(f'[green]Paused {task_id}.[/green]' if ok else f'[red]No scheduled task with id {task_id}.[/red]')
+            elif first_word == 'resume':
+                ok = scheduler.set_enabled(task_id, True)
+                console.print(f'[green]Resumed {task_id}.[/green]' if ok else f'[red]No scheduled task with id {task_id}.[/red]')
+            elif first_word in ('delete', 'remove', 'cancel'):
+                ok = scheduler.remove_task(task_id)
+                console.print(f'[green]Deleted {task_id}.[/green]' if ok else f'[red]No scheduled task with id {task_id}.[/red]')
+            elif first_word == 'run':
+                task = scheduler.get_task(task_id)
+                if not task:
+                    console.print(f'[red]No scheduled task with id {task_id}.[/red]')
+                else:
+                    console.print(f'[cyan]Running {task_id} ("{task["name"]}") now in the background...[/cyan]')
+                    scheduler.run_task_in_background(task_id)
+            return 'handled'
+
+        if '::' not in rest:
+            console.print(Panel(SCHEDULE_HELP, title='[bold cyan]/schedule help', border_style='cyan'))
+            return 'handled'
+
+        spec_part, prompt_part = rest.split('::', 1)
+        task, err = scheduler.add_task(prompt_part.strip(), spec_part.strip())
+        if err:
+            console.print(f'[bold red]Could not create scheduled task:[/bold red] {err}')
+        else:
+            nr_text = scheduler.format_dt(task.get('next_run'))
+            console.print(f'[bold green]Scheduled task created:[/bold green] {task["id"]}  (next run: {nr_text})')
+            if not config.TELEGRAM_BOT_TOKEN:
+                console.print('[dim]Note: no TELEGRAM_BOT_TOKEN configured, results will only be visible via /schedules, not delivered to Telegram.[/dim]')
+            elif not state.telegram_chat_id:
+                console.print('[dim]Note: Telegram isn\'t linked yet - run /telegram once to link it so results get delivered there too.[/dim]')
         return 'handled'
 
     if cmd == '/exit':

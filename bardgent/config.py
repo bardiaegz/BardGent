@@ -96,6 +96,8 @@ READONLY_TOOLS = {
     'read_memory', 'list_memory', 'Skill', 'list_skills',
     # Observe background jobs without mutating the project.
     'ListJobs', 'Await',
+    # Observing scheduled tasks doesn't mutate anything either.
+    'ListScheduledTasks',
 }
 
 # ---------------------------------------------------------------------------

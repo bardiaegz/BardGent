@@ -9,7 +9,7 @@ from bardgent.telegram import _load_telegram_chat_id
 
 
 class AgentState:
-    def __init__(self, system_prompt, name='main', track_session=True, mode='normal'):
+    def __init__(self, system_prompt, name='main', track_session=True, mode='normal', unattended=False):
         self.name = name
         self.messages = [{'role': 'system', 'content': system_prompt}]
         self.shell_cwd = __import__('os').getcwd()
@@ -19,6 +19,11 @@ class AgentState:
         self.telegram_enabled = False
         self.telegram_chat_id = _load_telegram_chat_id() if name == 'main' else None
         self.mode = mode if mode in config.VALID_MODES else 'normal'
+        # True for scheduled-task / other unattended sub-agent runs: nobody
+        # is at the keyboard, so we must never call input() to ask for
+        # approval - dangerous actions are auto-denied instead of hanging
+        # the background thread forever.
+        self.unattended = unattended
 
 
 def ask_approval(state, key, question, dangerous=False):
@@ -28,8 +33,21 @@ def ask_approval(state, key, question, dangerous=False):
       - auto:   non-dangerous actions are auto-approved with no prompt at all.
                 Dangerous actions ALWAYS still prompt, even in auto mode.
       - plan/normal: unchanged, per-action prompts, with 'a' to remember.
+
+    Unattended behaviour (state.unattended=True, e.g. scheduled tasks):
+      - No input() is ever called, since there's no user present to answer.
+      - Dangerous actions are auto-denied (never silently executed).
+      - Non-dangerous actions are auto-approved (unattended sub-agents
+        already run in 'auto' mode, this is just a safety-net for callers
+        that construct state differently).
     """
     with state.approval_lock:
+        if getattr(state, 'unattended', False):
+            if dangerous:
+                log_event(f"[{state.name}] approval(dangerous) '{key}' -> auto-denied (unattended)")
+                return False
+            log_event(f"[{state.name}] approval '{key}' -> auto-approved (unattended)")
+            return True
         if state.mode == 'auto' and not dangerous:
             console.print(f"[dim]auto-approved ({key}) [auto mode][/dim]")
             log_event(f"[{state.name}] approval '{key}' -> auto-mode auto-approved")

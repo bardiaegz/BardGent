@@ -18,7 +18,7 @@ from bardgent import config
 from bardgent.config import console, log_event
 from bardgent.ui import print_welcome
 from bardgent.state import AgentState
-from bardgent.system_prompt import SYSTEM_PROMPT
+from bardgent.system_prompt import SYSTEM_PROMPT, refresh_system_message
 from bardgent.commands import COMMANDS, handle_command, switch_mode, MODE_CYCLE
 from bardgent.session import (
     save_session, trim_history, total_history_tokens,
@@ -29,6 +29,7 @@ from bardgent.tool_schemas import TOOLS, dispatch_tool
 from bardgent.utils import truncate_output
 from bardgent.status_bar import enable_status_bar, disable_status_bar, install_resize_handler
 from bardgent.exec_tools import cleanup_jobs
+from bardgent import scheduler
 
 
 def main():
@@ -60,6 +61,13 @@ def main():
     atexit.register(disable_status_bar)
     atexit.register(cleanup_jobs)
     install_resize_handler(state)
+
+    # Recurring/on-demand scheduled tasks (Cowork-style): a background thread
+    # that fires due tasks as isolated sub-agents and delivers results over
+    # Telegram, independent of this REPL loop - runs even while you're mid
+    # conversation. See /schedule, /schedules, and scheduler.py.
+    scheduler.start_scheduler()
+    atexit.register(scheduler.stop_scheduler)
 
     auto_continue = False
     while True:
@@ -96,6 +104,8 @@ def main():
                 continue
         else:
             state.messages.append({'role': 'user', 'content': user_input})
+
+        refresh_system_message(state)
 
         if total_history_tokens(state) > config.AUTO_SUMMARY_TOKEN_THRESHOLD:
             console.print('[dim]Context getting large, auto-summarizing...[/dim]')

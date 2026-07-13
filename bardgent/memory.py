@@ -29,6 +29,23 @@ def save_memory(text: str):
     return "Memory saved."
 
 
+def memory_context_block():
+    """Formatted saved memories, ready to embed directly in a system prompt.
+
+    This is what makes memory actually reliable: instead of depending on the
+    model remembering to call read_memory() before every question that might
+    need it (it often won't), the current contents are baked straight into
+    the system message and refreshed every turn (see system_prompt.py /
+    main.py). The read_memory/save_memory/list_memory/delete_memory tools
+    stay available for the model to manage memory explicitly, but answering
+    from known facts no longer requires a tool call at all.
+    """
+    mem = read_memory().strip()
+    if not mem:
+        return '(none saved yet)'
+    return mem
+
+
 def list_memory():
     """Return saved memories as a numbered list so the user/model can reference an index to delete."""
     if not config.MEMORY_FILE.exists():

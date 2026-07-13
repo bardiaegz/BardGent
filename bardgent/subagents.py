@@ -3,7 +3,10 @@
 Sub-agents always run in 'auto' mode: they're isolated, self-contained
 delegated work, so per-tool-call prompts would just block the whole
 session waiting on a decision the user can't fully see context for.
-Genuinely dangerous shell commands still always prompt regardless of mode.
+Genuinely dangerous shell commands still always prompt regardless of mode
+- UNLESS the sub-agent is unattended (e.g. a scheduled task with nobody at
+the keyboard), in which case dangerous actions are auto-denied instead of
+blocking on input() forever (see state.ask_approval).
 """
 
 import json
@@ -33,19 +36,28 @@ def _sub_system_prompt():
     )
 
 
-def run_subagent(task_prompt, max_iters=15, render=True, label=None):
+def run_subagent(task_prompt, max_iters=15, render=True, label=None, unattended=False):
     """Run one isolated sub-agent to completion and return its final text.
 
     render=True  -> normal single-Task behaviour: live-streamed output.
-    render=False -> used when multiple sub-agents run concurrently (Tasks);
-                     uses plain blocking model calls and lock-protected
-                     status lines so parallel threads don't fight over the
+    render=False -> used when multiple sub-agents run concurrently (Tasks),
+                     or when running unattended (scheduled tasks); uses plain
+                     blocking model calls and lock-protected status lines so
+                     parallel/background threads don't fight over the
                      terminal.
+    unattended=True -> nobody is present to answer an approval prompt (e.g.
+                     a scheduled task firing on its own clock). Dangerous
+                     shell commands are auto-denied rather than blocking on
+                     input() forever; everything else behaves like normal
+                     'auto' mode.
     """
     from bardgent.tool_schemas import dispatch_tool, SUBAGENT_TOOLS
 
     tag = f"[{label}] " if label else ''
-    sub_state = AgentState(_sub_system_prompt(), name='sub', track_session=False, mode='auto')
+    sub_state = AgentState(
+        _sub_system_prompt(), name='sub', track_session=False, mode='auto',
+        unattended=unattended,
+    )
     sub_state.messages.append({'role': 'user', 'content': task_prompt})
 
     if render:

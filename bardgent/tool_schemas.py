@@ -1,7 +1,7 @@
 """OpenAI-style tool schemas, argument validation, and the single dispatch
 point every tool call (main loop or sub-agent) goes through."""
 
-from bardgent import config, memory, skills
+from bardgent import config, memory, skills, scheduler
 from bardgent.config import log_event
 from bardgent.web_tools import WebSearch, Fetch
 from bardgent.fs_tools import Read, Write, Edit, Undo, Glob, Grep
@@ -163,6 +163,62 @@ TOOLS = [
             }
         }, 'required': ['prompts']}
     }},
+    {'type': 'function', 'function': {
+        'name': 'ScheduleTask',
+        'description': (
+            'Create a recurring (or one-off) scheduled task, the same way Claude Cowork lets you '
+            'describe recurring work once and have it run automatically. The prompt is saved and run '
+            'later as its own isolated sub-agent session (same tools available, unattended - dangerous '
+            'shell commands are auto-declined rather than prompted for, since nobody is watching). '
+            'The finished result is delivered to the user over Telegram (if linked via /telegram), and '
+            'always recorded for review via ListScheduledTasks. Use this whenever the user asks for '
+            'something to happen "every day/week", "on a schedule", "recurring", or similar - do not '
+            'just say you will remember to do it, actually call this tool.'
+        ),
+        'parameters': {'type': 'object', 'properties': {
+            'prompt': {'type': 'string', 'description': 'the full task instructions to run each time, exactly as a sub-agent should receive them'},
+            'schedule': {
+                'type': 'string',
+                'description': (
+                    "when to run it. Formats: 'every 30m' / 'every 2h' / 'every 1d' (recurring interval, "
+                    "min 60s), 'daily 09:00' or 'daily 6pm', 'weekly mon 09:00', "
+                    "'once 2026-07-20 09:00' (single run), or 'cron */15 * * * *' (standard 5-field cron)."
+                ),
+            },
+            'name': {'type': 'string', 'description': 'short human-readable label for the task (optional, derived from the prompt if omitted)'},
+        }, 'required': ['prompt', 'schedule']}
+    }},
+    {'type': 'function', 'function': {
+        'name': 'ListScheduledTasks',
+        'description': 'List every scheduled task (id, name, schedule, next/last run, enabled state, run count).',
+        'parameters': {'type': 'object', 'properties': {}},
+    }},
+    {'type': 'function', 'function': {
+        'name': 'ToggleScheduledTask',
+        'description': 'Pause or resume a scheduled task by id (from ListScheduledTasks). Paused tasks never fire until resumed.',
+        'parameters': {'type': 'object', 'properties': {
+            'task_id': {'type': 'string', 'description': "the task's id, e.g. 'sched_ab12cd34'"},
+            'enabled': {'type': 'boolean', 'description': 'true to resume/enable, false to pause'},
+        }, 'required': ['task_id', 'enabled']}
+    }},
+    {'type': 'function', 'function': {
+        'name': 'CancelScheduledTask',
+        'description': 'Permanently delete a scheduled task by id (from ListScheduledTasks). This cannot be undone.',
+        'parameters': {'type': 'object', 'properties': {
+            'task_id': {'type': 'string', 'description': "the task's id, e.g. 'sched_ab12cd34'"}
+        }, 'required': ['task_id']}
+    }},
+    {'type': 'function', 'function': {
+        'name': 'RunScheduledTaskNow',
+        'description': (
+            'Trigger a scheduled task on demand, right now, instead of waiting for its next '
+            'scheduled time. Runs in the background and returns immediately - the result is '
+            'delivered over Telegram (if linked) and recorded, exactly like a normal scheduled run.'
+        ),
+        'parameters': {'type': 'object', 'properties': {
+            'task_id': {'type': 'string', 'description': "the task's id, e.g. 'sched_ab12cd34'"}
+        }, 'required': ['task_id']}
+    }},
 ]
 
 # Sub-agents get every tool except Task/Tasks themselves, to prevent recursive spawning.
@@ -243,6 +299,39 @@ def dispatch_tool(name, args, state):
             return ListJobs()
         elif name == 'Await':
             return Await(args['job_id'], args.get('timeout'))
+        elif name == 'ScheduleTask':
+            task, sched_err = scheduler.add_task(args['prompt'], args['schedule'], args.get('name'))
+            if sched_err:
+                return f"Error: could not create scheduled task: {sched_err}"
+            nr = scheduler.format_dt(task.get('next_run'))
+            return (
+                f"Scheduled task created: {task['id']} (\"{task['name']}\"). "
+                f"Schedule: {task['schedule_spec']}. Next run: {nr}. "
+                f"Results will be sent over Telegram if linked (/telegram), and are always "
+                f"visible via ListScheduledTasks / /schedules."
+            )
+        elif name == 'ListScheduledTasks':
+            return scheduler.list_tasks_text()
+        elif name == 'ToggleScheduledTask':
+            ok = scheduler.set_enabled(args['task_id'], bool(args['enabled']))
+            if not ok:
+                return f"Error: no scheduled task with id '{args['task_id']}'. Use ListScheduledTasks() to see valid ids."
+            return f"Task {args['task_id']} {'resumed' if args['enabled'] else 'paused'}."
+        elif name == 'CancelScheduledTask':
+            ok = scheduler.remove_task(args['task_id'])
+            if not ok:
+                return f"Error: no scheduled task with id '{args['task_id']}'. Use ListScheduledTasks() to see valid ids."
+            return f"Task {args['task_id']} deleted."
+        elif name == 'RunScheduledTaskNow':
+            task = scheduler.get_task(args['task_id'])
+            if not task:
+                return f"Error: no scheduled task with id '{args['task_id']}'. Use ListScheduledTasks() to see valid ids."
+            scheduler.run_task_in_background(args['task_id'])
+            return (
+                f"Started task {args['task_id']} (\"{task['name']}\") now, running in the "
+                f"background. The result will be delivered over Telegram (if linked) and recorded "
+                f"for review shortly - it is not ready yet."
+            )
         else:
             return 'Unknown tool'
     except Exception as e:

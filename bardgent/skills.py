@@ -163,6 +163,9 @@ def install_skill_from_github(github_url: str) -> str:
     
     Args:
         github_url: GitHub repository URL (e.g., https://github.com/alirezarezvani/claude-skills)
+                    Also supports tree/blob URLs like:
+                    https://github.com/owner/repo/tree/branch/path/to/skill
+                    https://github.com/owner/repo/blob/branch/path/to/skill/SKILL.md
     
     Returns:
         Status message string
@@ -183,17 +186,31 @@ def install_skill_from_github(github_url: str) -> str:
     
     owner, repo = path_parts[0], path_parts[1]
     
+    # Handle tree/blob URLs - extract the base repo URL and the subdirectory path
+    subdir_path = None
+    if len(path_parts) >= 4 and path_parts[2] in ('tree', 'blob'):
+        # URL format: /owner/repo/tree/branch/path/to/dir
+        # or: /owner/repo/blob/branch/path/to/file
+        branch = path_parts[3]
+        subdir_parts = path_parts[4:]
+        if subdir_parts:
+            subdir_path = '/'.join(subdir_parts)
+            # If it's a blob URL pointing to a file, use the parent directory
+            if path_parts[2] == 'blob':
+                subdir_path = '/'.join(subdir_parts[:-1])
+    
     # Determine target directory (user-global skills directory)
     target_dir = config.GLOBAL_DIR / "skills"
     target_dir.mkdir(parents=True, exist_ok=True)
     
-    # Clone to a temporary directory
+    # Clone to a temporary directory - use base repo URL
+    base_repo_url = f"https://github.com/{owner}/{repo}.git"
     with tempfile.TemporaryDirectory() as tmpdir:
         repo_path = Path(tmpdir) / repo
         try:
             # Clone the repository
             result = subprocess.run(
-                ['git', 'clone', '--depth', '1', github_url, str(repo_path)],
+                ['git', 'clone', '--depth', '1', base_repo_url, str(repo_path)],
                 capture_output=True,
                 text=True,
                 timeout=60
@@ -201,9 +218,16 @@ def install_skill_from_github(github_url: str) -> str:
             if result.returncode != 0:
                 return f"[bold red]Error cloning repository:[/bold red] {result.stderr.strip()}"
             
+            # Determine search path
+            search_path = repo_path
+            if subdir_path:
+                search_path = repo_path / subdir_path
+                if not search_path.exists():
+                    return f"[bold red]Error:[/bold red] Path '{subdir_path}' not found in repository"
+            
             # Find all skill directories (directories containing SKILL.md) - recursively
             skill_dirs = []
-            for skill_md in repo_path.rglob("SKILL.md"):
+            for skill_md in search_path.rglob("SKILL.md"):
                 skill_dirs.append(skill_md.parent)
             
             if not skill_dirs:
