@@ -19,6 +19,7 @@ from rich.syntax import Syntax
 from bardgent import config
 from bardgent.config import console, log_event
 from bardgent.checkpoints import make_git_checkpoint
+from bardgent.permissions import is_tool_permitted
 from bardgent.state import ask_approval
 
 _known_mtimes = {}
@@ -160,9 +161,9 @@ def confirm_diff(old, new, path, tool_name, state):
                     segment.style = f"{segment.style} on dark_red" if segment.style else "white on dark_red"
                 body.append(rendered)
             except Exception:
-                body.append(f"{new_no:>4} + {line[1:]}".ljust(bar_width), style=DEL_STYLE)
+                body.append(f"{old_no:>4} - {line[1:]}".ljust(bar_width), style=DEL_STYLE)
             body.append('\n')
-            new_no += 1
+            old_no += 1
         else:
             body.append(f"{new_no:>4}   {line[1:]}\n", style='dim')
             old_no += 1
@@ -172,6 +173,10 @@ def confirm_diff(old, new, path, tool_name, state):
         body = Text('(no changes)', style='dim')
     with state.approval_lock:
         console.print(Panel(body, title=f"[bold yellow]{tool_name}: {path}", border_style='yellow'))
+        if is_tool_permitted(tool_name):
+            console.print(f"[dim]auto-approved ({tool_name}) [permissions.json][/dim]")
+            log_event(f"[{state.name}] approval '{tool_name}' -> permitted via permissions.json")
+            return True
         return ask_approval(state, tool_name, "Apply this change?")
 
 

@@ -7,6 +7,8 @@ the same skills catalogue as the main agent, instead of a stripped-down
 prompt.
 """
 
+import datetime
+
 from bardgent import config
 from bardgent.skills import SKILL_REGISTRY, format_skills_catalogue
 from bardgent.project_instructions import format_project_instructions_section
@@ -109,6 +111,7 @@ def build_system_prompt():
     project_instructions = format_project_instructions_section()
     skills_and_rules = build_skills_and_rules_block()
     memory_block = memory_context_block()
+    now = datetime.datetime.now().astimezone()
 
     return f"""
 You are a helpful coding agent.
@@ -116,9 +119,9 @@ Your name is Bardgent made by Bardia.
 Don't use emoji.
 ALWAYS when user wants explanation respond in an adhd friendly mode: consise by default, tl;dr first, bullet points over paragraphs, nerdy but tight, no rambling- pause and wait if more depth is needed
 
-DATETIME: {config.DATETIME.strftime('%Y-%B-%d %I:%M %p %Z')}
+DATETIME: {now.strftime('%Y-%B-%d %I:%M %p %Z')}
 
-{config.SYSTEM_INFO}
+{config.get_system_info()}
 
 {project_instructions}
 
@@ -164,9 +167,9 @@ KNOWN USER MEMORY (persisted across sessions and /clear, refreshed every turn):
 - Skills live in (checked in this order, first match wins per name):
   ./.bardgent/skills/<name>/SKILL.md   (this project only)
   ~/.bardgent/skills/<name>/SKILL.md   (installed for this user, every project)
-  bundled skills shipped with bardgent itself
-  Users can drop a new folder into either location at any time; if one seems
-  to be missing, suggest they add it there.
+  <package>/skills/<name>/SKILL.md     (optional bundled defaults, if present)
+  Users can install skills with /skill install <github_url>, or drop a folder
+  with SKILL.md into either of the first two locations at any time.
 
 Delegation:
 - Task(prompt): Delegate a single self-contained, multi-step subtask (e.g. a broad

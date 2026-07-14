@@ -419,75 +419,113 @@ def list_tasks_text(tasks=None):
 # Execution
 # ---------------------------------------------------------------------------
 
+# Scheduled tasks often need a few more tool calls than an ad-hoc Task()
+# (e.g. several searches/fetches to put together a news digest), so give
+# them more headroom than the default 15 before giving up.
+SCHEDULED_TASK_MAX_ITERS = 40
+
+# Guards against the same task executing twice at once - e.g. the periodic
+# scheduler loop firing a due task right as someone also triggers it with
+# /schedule run or RunScheduledTaskNow. Without this, both runs execute
+# concurrently and both delivered results land in Telegram, which looks like
+# the task ran multiple times on its own.
+_running_task_ids = set()
+_running_lock = threading.Lock()
+
+
+def is_task_running(task_id):
+    with _running_lock:
+        return task_id in _running_task_ids
+
+
 def _execute_scheduled_task(task_id):
     """Run one scheduled task to completion (blocking) and record/deliver
-    the result. Safe to call directly from a background thread."""
-    tasks = load_tasks()
-    idx = next((i for i, t in enumerate(tasks) if t['id'] == task_id), None)
-    if idx is None:
-        return
-    task = tasks[idx]
+    the result. Safe to call directly from a background thread. No-ops if
+    this task is already running elsewhere (see _running_task_ids above)."""
+    with _running_lock:
+        if task_id in _running_task_ids:
+            log_event(f"SCHEDULE RUN SKIPPED {task_id}: already running elsewhere")
+            return
+        _running_task_ids.add(task_id)
 
-    with console_lock:
-        console.print(Panel(
-            task['prompt'],
-            title=f"[bold magenta]SCHEDULED TASK running: {task['name']} ({task['id']})",
-            border_style='magenta',
-        ))
-    log_event(f"SCHEDULE RUN START {task_id}: {task['schedule_spec']!r}")
-
-    status = 'ok'
     try:
-        from bardgent.subagents import run_subagent
-        result = run_subagent(task['prompt'], render=False, label=task['name'], unattended=True)
-    except Exception as e:
-        status = 'error'
-        result = f"Scheduled task failed: {type(e).__name__}: {e}"
-        log_event(f"SCHEDULE RUN ERROR {task_id}: {type(e).__name__}: {e}")
-
-    now = datetime.now().astimezone()
-
-    with _store_lock:
         tasks = load_tasks()
         idx = next((i for i, t in enumerate(tasks) if t['id'] == task_id), None)
         if idx is None:
-            return  # deleted while it was running
+            return
         task = tasks[idx]
-        task['last_run'] = now.isoformat()
-        task['run_count'] = task.get('run_count', 0) + 1
-        task['last_status'] = status
-        task['last_summary'] = (result or '')[:500]
 
-        if task['schedule_type'] == 'once':
-            task['enabled'] = False
-            task['next_run'] = None
-        elif task.get('enabled', True):
-            nxt = compute_next_run(task['schedule_type'], task['params'], after=now)
-            task['next_run'] = nxt.isoformat() if nxt else None
+        with console_lock:
+            console.print(Panel(
+                task['prompt'],
+                title=f"[bold magenta]SCHEDULED TASK running: {task['name']} ({task['id']})",
+                border_style='magenta',
+            ))
+        log_event(f"SCHEDULE RUN START {task_id}: {task['schedule_spec']!r}")
 
-        tasks[idx] = task
-        save_tasks(tasks)
+        status = 'ok'
+        try:
+            from bardgent.subagents import run_subagent, INCOMPLETE_RESULT
+            result = run_subagent(
+                task['prompt'], render=False, label=task['name'], unattended=True,
+                max_iters=SCHEDULED_TASK_MAX_ITERS,
+            )
+            if result.strip() == INCOMPLETE_RESULT:
+                status = 'incomplete'
+                log_event(f"SCHEDULE RUN {task_id}: hit max_iters ({SCHEDULED_TASK_MAX_ITERS}) without finishing")
+        except Exception as e:
+            status = 'error'
+            result = f"Scheduled task failed: {type(e).__name__}: {e}"
+            log_event(f"SCHEDULE RUN ERROR {task_id}: {type(e).__name__}: {e}")
 
-    chat_id = _load_telegram_chat_id()
-    if chat_id and config.TELEGRAM_BOT_TOKEN:
-        header = f"Scheduled task \"{task['name']}\" finished ({status})\n\n"
-        if not send_telegram_message(header + (result or '(no output)'), chat_id):
-            log_event(f"SCHEDULE RUN {task_id}: Telegram delivery failed (see log above)")
-    else:
-        log_event(f"SCHEDULE RUN {task_id}: no Telegram chat linked (run /telegram to link); result not sent")
+        now = datetime.now().astimezone()
 
-    with console_lock:
-        console.print(Panel(
-            result or '(empty result)',
-            title=f"[bold magenta]SCHEDULED TASK finished: {task['name']} ({task['id']}) [{status}]",
-            border_style='magenta',
-        ))
-    log_event(f"SCHEDULE RUN DONE {task_id} status={status}")
+        with _store_lock:
+            tasks = load_tasks()
+            idx = next((i for i, t in enumerate(tasks) if t['id'] == task_id), None)
+            if idx is None:
+                return  # deleted while it was running
+            task = tasks[idx]
+            task['last_run'] = now.isoformat()
+            task['run_count'] = task.get('run_count', 0) + 1
+            task['last_status'] = status
+            task['last_summary'] = (result or '')[:500]
+
+            if task['schedule_type'] == 'once':
+                task['enabled'] = False
+                task['next_run'] = None
+            elif task.get('enabled', True):
+                nxt = compute_next_run(task['schedule_type'], task['params'], after=now)
+                task['next_run'] = nxt.isoformat() if nxt else None
+
+            tasks[idx] = task
+            save_tasks(tasks)
+
+        chat_id = _load_telegram_chat_id()
+        if chat_id and config.TELEGRAM_BOT_TOKEN:
+            header = f"Scheduled task \"{task['name']}\" finished ({status})"
+            if not send_telegram_message(result or '(no output)', chat_id, header=header):
+                log_event(f"SCHEDULE RUN {task_id}: Telegram delivery failed (see log above)")
+        else:
+            log_event(f"SCHEDULE RUN {task_id}: no Telegram chat linked (run /telegram to link); result not sent")
+
+        with console_lock:
+            console.print(Panel(
+                result or '(empty result)',
+                title=f"[bold magenta]SCHEDULED TASK finished: {task['name']} ({task['id']}) [{status}]",
+                border_style='magenta',
+            ))
+        log_event(f"SCHEDULE RUN DONE {task_id} status={status}")
+    finally:
+        with _running_lock:
+            _running_task_ids.discard(task_id)
 
 
 def run_task_in_background(task_id):
     """Fire off a scheduled task immediately (on-demand), without blocking
-    the caller. Used by /schedule run and the RunScheduledTaskNow tool."""
+    the caller. Used by /schedule run and the RunScheduledTaskNow tool.
+    Returns the thread; if the task is already running, _execute_scheduled_task
+    will simply no-op once it starts (see is_task_running for checking first)."""
     t = threading.Thread(
         target=_execute_scheduled_task, args=(task_id,),
         daemon=True, name=f'bardgent-schedule-{task_id}',

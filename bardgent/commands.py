@@ -15,6 +15,7 @@ from bardgent.skills import install_skill_from_github
 from bardgent.system_prompt import refresh_system_message
 
 COMMANDS = {
+    '/help': 'List all slash commands',
     '/summary': 'Summarize the current conversation',
     '/model': 'Show the current model, or switch: /model <name>',
     '/clear': 'Clear history and start a new session',
@@ -66,17 +67,27 @@ def switch_mode(state, new_mode, announce=True):
     state.mode = new_mode
     if announce:
         color = _MODE_COLOR.get(new_mode, 'white')
-        console.print(f'[{color}]Mode switched: {old_mode} -> {new_mode}[/{color}]')
-        if new_mode == 'plan':
-            console.print('[dim]Only read-only tools are allowed until you switch back with /normal or /auto.[/dim]')
-        elif new_mode == 'auto':
-            console.print('[dim]Non-dangerous actions will be auto-approved without asking. '
-                          'Dangerous commands (rm, sudo, chmod, kill, ...) still always ask.[/dim]')
+        # console.print(f'[{color}]Mode switched: {old_mode} -> {new_mode}[/{color}]')
+        # if new_mode == 'plan':
+        #     console.print('[dim]Only read-only tools are allowed until you switch back with /normal or /auto.[/dim]')
+        # elif new_mode == 'auto':
+        #     console.print('[dim]Non-dangerous actions will be auto-approved without asking. '
+        #                   'Dangerous commands (rm, sudo, chmod, kill, ...) still always ask.[/dim]')
     log_event(f"[{state.name}] MODE {old_mode} -> {new_mode}")
+    try:
+        from bardgent.status_bar import draw_status_bar
+        draw_status_bar(state, force=True)
+    except Exception:
+        pass
 
 
 def handle_command(user_input, state):
     cmd = user_input.strip().lower()
+
+    if cmd in ('/help', '/?'):
+        lines = [f"  [bold cyan]{name}[/bold cyan]  {desc}" for name, desc in COMMANDS.items()]
+        console.print(Panel('\n'.join(lines), title='[bold cyan]Commands', border_style='cyan'))
+        return 'handled'
 
     if cmd == '/model' or cmd.startswith('/model '):
         parts = user_input.strip().split(maxsplit=1)
@@ -102,6 +113,7 @@ def handle_command(user_input, state):
         from bardgent.ui import print_welcome  # local import: avoids a circular import with main.py
         del state.messages[1:]
         state.session_file = config.SESSION_DIR / session_file_name()
+        state.last_prompt_tokens = None
         refresh_system_message(state)
         console.clear()
         print_welcome()
@@ -172,6 +184,8 @@ def handle_command(user_input, state):
                 task = scheduler.get_task(task_id)
                 if not task:
                     console.print(f'[red]No scheduled task with id {task_id}.[/red]')
+                elif scheduler.is_task_running(task_id):
+                    console.print(f'[yellow]{task_id} ("{task["name"]}") is already running - not starting a second one.[/yellow]')
                 else:
                     console.print(f'[cyan]Running {task_id} ("{task["name"]}") now in the background...[/cyan]')
                     scheduler.run_task_in_background(task_id)

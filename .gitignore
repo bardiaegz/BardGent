@@ -11,3 +11,4 @@ pyproject.toml
 __init__.py
 *.txt
 permissions.json
+checkpoint*

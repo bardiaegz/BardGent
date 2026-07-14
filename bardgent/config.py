@@ -57,7 +57,7 @@ READ_MAX_LIMIT = 5_000
 RESPONSE_TOKEN_RESERVE = 8_192
 MAX_HISTORY_TOKENS = 180_000
 AUTO_SUMMARY_TOKEN_THRESHOLD = 140_000
-CONTEXT_WINDOW_TOKENS = 256_000
+CONTEXT_WINDOW_TOKENS = 1_000_000
 
 # Retry schedule for transient API failures.
 MODEL_MAX_RETRIES = 10
@@ -176,8 +176,15 @@ IS_WARP = os.environ.get('TERM_PROGRAM') == 'WarpTerminal'
 
 DATETIME = datetime.datetime.now().astimezone()
 
-SYSTEM_INFO = f"""[CRITICAL SYSTEM INFO]:
+
+def get_system_info():
+    """Fresh system info for system prompts (CWD can change via Bash)."""
+    return f"""[CRITICAL SYSTEM INFO]:
 - Python Executable Path: {python_path}
 - Operating System: {operating_system}
-- Current Working Directory: {working_directory}
+- Current Working Directory: {os.getcwd()}
 - User Home Directory: {home_directory}"""
+
+
+# Kept for backward compatibility; prefer get_system_info() in prompts.
+SYSTEM_INFO = get_system_info()

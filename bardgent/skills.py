@@ -188,6 +188,7 @@ def install_skill_from_github(github_url: str) -> str:
     
     # Handle tree/blob URLs - extract the base repo URL and the subdirectory path
     subdir_path = None
+    branch = None
     if len(path_parts) >= 4 and path_parts[2] in ('tree', 'blob'):
         # URL format: /owner/repo/tree/branch/path/to/dir
         # or: /owner/repo/blob/branch/path/to/file
@@ -197,7 +198,7 @@ def install_skill_from_github(github_url: str) -> str:
             subdir_path = '/'.join(subdir_parts)
             # If it's a blob URL pointing to a file, use the parent directory
             if path_parts[2] == 'blob':
-                subdir_path = '/'.join(subdir_parts[:-1])
+                subdir_path = '/'.join(subdir_parts[:-1]) if len(subdir_parts) > 1 else None
     
     # Determine target directory (user-global skills directory)
     target_dir = config.GLOBAL_DIR / "skills"
@@ -208,9 +209,13 @@ def install_skill_from_github(github_url: str) -> str:
     with tempfile.TemporaryDirectory() as tmpdir:
         repo_path = Path(tmpdir) / repo
         try:
-            # Clone the repository
+            # Clone the repository (honor branch from tree/blob URLs)
+            clone_cmd = ['git', 'clone', '--depth', '1']
+            if branch:
+                clone_cmd.extend(['-b', branch])
+            clone_cmd.extend([base_repo_url, str(repo_path)])
             result = subprocess.run(
-                ['git', 'clone', '--depth', '1', base_repo_url, str(repo_path)],
+                clone_cmd,
                 capture_output=True,
                 text=True,
                 timeout=60

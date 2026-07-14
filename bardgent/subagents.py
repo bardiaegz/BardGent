@@ -21,22 +21,59 @@ from bardgent.state import AgentState
 from bardgent.utils import truncate_output
 from bardgent.model import stream_agent_response, call_model
 from bardgent.system_prompt import build_skills_and_rules_block
+from bardgent.project_instructions import format_project_instructions_section
+from bardgent.memory import memory_context_block
+
+# Returned verbatim by run_subagent() when it hits max_iters without a final
+# answer. Exposed as a constant (rather than making callers match a literal
+# string) so scheduler.py can reliably tell an incomplete run apart from a
+# genuinely finished one.
+INCOMPLETE_RESULT = "(sub-agent hit max iterations without finishing)"
+
+# Default tool-loop budget for delegated work. Main agent uses 100; sub-agents
+# used to cap at 15 and frequently returned INCOMPLETE_RESULT on multi-file jobs.
+DEFAULT_SUBAGENT_MAX_ITERS = 40
 
 
-def _sub_system_prompt():
+def _sub_system_prompt(unattended=False):
     # Same skills catalogue + tool-usage rules as the main agent, so
     # sub-agents follow identical conventions (Read paging, Edit fuzzy-match
     # behaviour, background Bash jobs, when to reach for a skill, etc.)
     # instead of a stripped-down prompt that drifts out of sync over time.
-    return (
+    # Also inject project instructions and long-term memory so delegated work
+    # sees the same AGENTS.md / user facts as the main agent.
+    intro = (
         "You are a focused sub-agent spawned to complete one delegated task.\n"
         "Use the available tools as needed, then reply with ONLY the final "
-        "result, no meta-commentary about being a sub-agent.\n\n"
-        + build_skills_and_rules_block() + "\n\n" + config.SYSTEM_INFO
+        "result, no meta-commentary about being a sub-agent."
+    )
+    if unattended:
+        intro += (
+            "\n\nThis run is a SCHEDULED TASK, executing on its own with nobody watching. "
+            "Whatever plain text you give as your final answer is automatically delivered to "
+            "the user over Telegram right after you finish - you do not send it yourself, and "
+            "you have no way to call the Telegram Bot API directly (no bot token, no chat id, "
+            "no HTTP access to Telegram). Never write curl commands, Python scripts, or "
+            "instructions for setting up a bot or chat id, and never ask the user for a bot "
+            "token or chat id - that delivery step is already handled outside of you. Just "
+            "produce the finished result itself (e.g. the actual news summary, the actual "
+            "report) as your final answer, written in normal markdown (**bold**, bullet lists, "
+            "etc.) - it gets converted to Telegram's formatting automatically. Work "
+            "efficiently: you have a limited number of tool calls, so don't repeat searches "
+            "that already gave you enough to work with."
+        )
+    project_instructions = format_project_instructions_section()
+    memory_block = memory_context_block()
+    return (
+        intro
+        + "\n\n" + config.get_system_info()
+        + "\n\n" + project_instructions
+        + "\n\nKNOWN USER MEMORY (same as main agent):\n" + memory_block
+        + "\n\n" + build_skills_and_rules_block()
     )
 
 
-def run_subagent(task_prompt, max_iters=15, render=True, label=None, unattended=False):
+def run_subagent(task_prompt, max_iters=DEFAULT_SUBAGENT_MAX_ITERS, render=True, label=None, unattended=False):
     """Run one isolated sub-agent to completion and return its final text.
 
     render=True  -> normal single-Task behaviour: live-streamed output.
@@ -49,13 +86,16 @@ def run_subagent(task_prompt, max_iters=15, render=True, label=None, unattended=
                      a scheduled task firing on its own clock). Dangerous
                      shell commands are auto-denied rather than blocking on
                      input() forever; everything else behaves like normal
-                     'auto' mode.
+                     'auto' mode. The sub-agent is also told explicitly that
+                     its answer gets auto-delivered over Telegram, so it
+                     doesn't try to "help" by inventing a bot-token setup
+                     flow of its own.
     """
     from bardgent.tool_schemas import dispatch_tool, SUBAGENT_TOOLS
 
     tag = f"[{label}] " if label else ''
     sub_state = AgentState(
-        _sub_system_prompt(), name='sub', track_session=False, mode='auto',
+        _sub_system_prompt(unattended=unattended), name='sub', track_session=False, mode='auto',
         unattended=unattended,
     )
     sub_state.messages.append({'role': 'user', 'content': task_prompt})
@@ -67,11 +107,14 @@ def run_subagent(task_prompt, max_iters=15, render=True, label=None, unattended=
             console.print(f"[bold magenta]{tag}SUB-AGENT started:[/bold magenta] {task_prompt[:100]}")
     log_event(f"SUBAGENT {tag}START: {task_prompt[:200]!r}")
 
+    made_any_tool_call = False
+    nudged_no_tool_first_turn = False
+
     for i in range(max_iters):
         if render:
-            final_text, tool_calls, _ = stream_agent_response(sub_state.messages, SUBAGENT_TOOLS)
+            final_text, tool_calls, _, _ = stream_agent_response(sub_state.messages, SUBAGENT_TOOLS)
         else:
-            final_text, tool_calls, _ = call_model(sub_state.messages, SUBAGENT_TOOLS)
+            final_text, tool_calls, _, _ = call_model(sub_state.messages, SUBAGENT_TOOLS)
             if tool_calls:
                 names = ', '.join(tc['name'] for tc in tool_calls)
                 with console_lock:
@@ -79,6 +122,32 @@ def run_subagent(task_prompt, max_iters=15, render=True, label=None, unattended=
 
         if not tool_calls:
             result = final_text.strip()
+
+            # Guard against a run declaring itself "done" after only
+            # announcing intent ("I'll search for current news...") without
+            # ever actually calling a tool - this happens occasionally with
+            # unattended runs and, left unchecked, delivers an empty
+            # non-answer as if it were the finished result. Nudge it once to
+            # actually do the work instead of accepting that as final.
+            if (unattended and i == 0 and not made_any_tool_call
+                    and not nudged_no_tool_first_turn and len(result) < 200):
+                nudged_no_tool_first_turn = True
+                log_event(
+                    f"SUBAGENT {tag}first-turn no-tool short reply looked like an intent "
+                    f"statement, not a result; nudging to actually do the work: {result[:100]!r}"
+                )
+                sub_state.messages.append({'role': 'assistant', 'content': result})
+                sub_state.messages.append({
+                    'role': 'user',
+                    'content': (
+                        "That was a statement of intent, not the finished result. Nobody is "
+                        "watching this run - actually use your tools now (WebSearch, Fetch, etc.) "
+                        "and then give the real, complete final answer with the actual content, "
+                        "not a description of what you're about to do."
+                    ),
+                })
+                continue
+
             if render:
                 console.print(Panel(result or '(empty result)', title='[bold magenta]SUB-AGENT finished', border_style='magenta'))
             else:
@@ -86,6 +155,8 @@ def run_subagent(task_prompt, max_iters=15, render=True, label=None, unattended=
                     console.print(Panel(result or '(empty result)', title=f'[bold magenta]{tag}SUB-AGENT finished', border_style='magenta'))
             log_event(f"SUBAGENT {tag}DONE")
             return result
+
+        made_any_tool_call = True
 
         for n, tc in enumerate(tool_calls):
             if not tc.get('id'):
@@ -118,10 +189,10 @@ def run_subagent(task_prompt, max_iters=15, render=True, label=None, unattended=
         # Avoid mid-loop trim (same Gemini empty-contents failure mode as main).
 
     log_event(f"SUBAGENT {tag}HIT MAX ITERATIONS")
-    return "(sub-agent hit max iterations without finishing)"
+    return INCOMPLETE_RESULT
 
 
-def run_subagents_parallel(prompts, max_iters=15, max_workers=5):
+def run_subagents_parallel(prompts, max_iters=DEFAULT_SUBAGENT_MAX_ITERS, max_workers=5):
     """Run several sub-agents concurrently (Tasks tool). Returns a single
     string combining every sub-agent's labeled result, in original order."""
     n = len(prompts)

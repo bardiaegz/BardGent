@@ -24,7 +24,9 @@ class AgentState:
         # approval - dangerous actions are auto-denied instead of hanging
         # the background thread forever.
         self.unattended = unattended
-
+        # Last real prompt-token count reported by the API (ground truth for
+        # the context bar). None until the first model call completes.
+        self.last_prompt_tokens = None
 
 def ask_approval(state, key, question, dangerous=False):
     """Ask the user to approve an action. 'a' remembers the approval for this session.

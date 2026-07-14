@@ -221,8 +221,14 @@ TOOLS = [
     }},
 ]
 
-# Sub-agents get every tool except Task/Tasks themselves, to prevent recursive spawning.
-SUBAGENT_TOOLS = [t for t in TOOLS if t['function']['name'] not in ('Task', 'Tasks')]
+# Sub-agents get every tool except Task/Tasks (no recursive spawning) and
+# schedule mutators (only the main agent / user CLI should create or cancel
+# recurring work). ListScheduledTasks stays so they can observe schedules.
+_SUBAGENT_EXCLUDED = {
+    'Task', 'Tasks',
+    'ScheduleTask', 'ToggleScheduledTask', 'CancelScheduledTask', 'RunScheduledTaskNow',
+}
+SUBAGENT_TOOLS = [t for t in TOOLS if t['function']['name'] not in _SUBAGENT_EXCLUDED]
 
 REQUIRED_ARGS = {t['function']['name']: t['function']['parameters'].get('required', []) for t in TOOLS}
 
@@ -326,6 +332,8 @@ def dispatch_tool(name, args, state):
             task = scheduler.get_task(args['task_id'])
             if not task:
                 return f"Error: no scheduled task with id '{args['task_id']}'. Use ListScheduledTasks() to see valid ids."
+            if scheduler.is_task_running(args['task_id']):
+                return f"Task {args['task_id']} (\"{task['name']}\") is already running - not starting a second one."
             scheduler.run_task_in_background(args['task_id'])
             return (
                 f"Started task {args['task_id']} (\"{task['name']}\") now, running in the "

@@ -15,6 +15,17 @@ from bardgent import config
 from bardgent.config import console, log_event, remove_thoughts
 
 
+def _repaint_status_if_possible():
+    """Keep the pinned bottom bar after Rich Live rewrites the screen."""
+    try:
+        from bardgent.status_bar import draw_status_bar, _current_state_for_resize
+        state = _current_state_for_resize[0]
+        if state is not None:
+            draw_status_bar(state, force=True)
+    except Exception:
+        pass
+
+
 def render_agent(text):
     return Group(Text('AGENT:', style='bold cyan'), Markdown(text))
 
@@ -83,7 +94,7 @@ def _stream_agent_response_once(messages, tools):
         concatenate fragments by index and never json.loads() until the
         stream is fully consumed.
 
-    Returns: (final_text, tool_calls, finish_reason)
+    Returns: (final_text, tool_calls, finish_reason, usage)
     """
     # Guard: Gemini rejects system-only payloads with
     # "GenerateContentRequest.contents: contents is not specified".
@@ -161,7 +172,9 @@ def _stream_agent_response_once(messages, tools):
     ordered_calls = [tool_calls[i] for i in sorted(tool_calls.keys()) if tool_calls[i].get('name')]
     final_text = ''.join(content_parts)
     final_text = remove_thoughts(final_text)
-    return final_text, ordered_calls, finish_reason
+    # Rich Live often resets the scroll region; re-pin the Claude-style footer.
+    _repaint_status_if_possible()
+    return final_text, ordered_calls, finish_reason, usage
 
 
 def _call_model_once(messages, tools):
@@ -186,7 +199,7 @@ def _call_model_once(messages, tools):
         {'id': tc.id, 'name': tc.function.name, 'arguments': tc.function.arguments}
         for tc in (msg.tool_calls or [])
     ]
-    return text, calls, choice.finish_reason
+    return text, calls, choice.finish_reason, getattr(response, 'usage', None)
 
 
 def call_model(messages, tools):

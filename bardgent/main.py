@@ -24,13 +24,23 @@ from bardgent.session import (
     save_session, trim_history, total_history_tokens,
     do_summary_and_compact, sanitize_history,
 )
-from bardgent.model import stream_agent_response
+from bardgent.model import stream_agent_response, print_usage
 from bardgent.tool_schemas import TOOLS, dispatch_tool
 from bardgent.utils import truncate_output
-from bardgent.status_bar import enable_status_bar, disable_status_bar, install_resize_handler
+from bardgent.status_bar import (
+    enable_status_bar, disable_status_bar, install_resize_handler, draw_status_bar,
+    make_bottom_toolbar, suspend_status_bar, resume_status_bar,
+)
 from bardgent.exec_tools import cleanup_jobs
 from bardgent import scheduler
 
+
+def _prompt_user(prompt_session, state, message):
+    suspend_status_bar()
+    try:
+        return prompt_session.prompt(message, multiline=False).strip()
+    finally:
+        resume_status_bar(state)
 
 def main():
     if not os.environ.get('GEMINI_API_KEY'):
@@ -53,10 +63,17 @@ def main():
         run_in_terminal(_do_switch)
 
     prompt_session = PromptSession(
-        completer=WordCompleter(list(COMMANDS.keys()), sentence=True),
-        key_bindings=mode_keys,
-    )
-
+            completer=WordCompleter(list(COMMANDS.keys()), sentence=True),
+            key_bindings=mode_keys,
+            # Pinned footer while waiting for USER: input (works in Warp + classic TTYs).
+            bottom_toolbar=make_bottom_toolbar(state),
+            # Rows reserved for the completion popup (e.g. slash-command menu).
+            # Too small a value here means the popup has nowhere to render and
+            # silently doesn't show up — this does NOT affect the toolbar.
+            reserve_space_for_menu=8,
+            erase_when_done=True,
+        )
+    
     enable_status_bar()
     atexit.register(disable_status_bar)
     atexit.register(cleanup_jobs)
@@ -79,13 +96,19 @@ def main():
                 auto_continue = False
             else:
                 try:
-                    user_input = prompt_session.prompt(HTML('<ansigreen><b>USER: </b></ansigreen>'), multiline=False).strip()
+                    user_input = _prompt_user(
+                        prompt_session, state,
+                        HTML('<ansigreen><b>USER: </b></ansigreen>'),
+                    )
                 except KeyboardInterrupt:
+                    resume_status_bar(state)
                     continue
                 except EOFError:
                     console.print('Goodbye!')
                     break
+                console.print(Text("USER: ", style="bold green") + Text(user_input))
         except KeyboardInterrupt:
+            resume_status_bar(state)
             continue
         except EOFError:
             console.print('Goodbye!')
@@ -121,8 +144,9 @@ def main():
         try:
             plan_completed_successfully = False
             for _ in range(config.MAX_ITERATIONS):
-                final_text, tool_calls, finish_reason = stream_agent_response(state.messages, TOOLS)
-
+                final_text, tool_calls, finish_reason, usage = stream_agent_response(state.messages, TOOLS)
+                if usage:
+                    state.last_prompt_tokens = usage.prompt_tokens + usage.completion_tokens
                 if tool_calls:
                     # Guarantee ids — some Gemini streams omit them on deltas.
                     for n, tc in enumerate(tool_calls):
@@ -162,10 +186,12 @@ def main():
                     # Do NOT trim mid tool-loop: aggressive trims were wiping the
                     # user turn and leaving system-only history (Gemini 400:
                     # "contents is not specified"). Trimming runs at turn start.
+                    draw_status_bar(state)
                     continue
 
                 final_text = config.remove_thoughts(final_text.strip())
                 state.messages.append({'role': 'assistant', 'content': final_text})
+                print_usage(usage)
                 if state.telegram_enabled and state.telegram_chat_id and final_text:
                     from bardgent.telegram import send_telegram_message
                     if not send_telegram_message(final_text, state.telegram_chat_id):
@@ -186,11 +212,12 @@ def main():
                 console.print(Panel(button_strip, title="[bold cyan]Next Action[/bold cyan]", border_style="cyan", expand=False))
 
                 try:
-                    ans = prompt_session.prompt(
+                    ans = _prompt_user(
+                        prompt_session, state,
                         HTML('<ansiyellow><b>Select option [1/2/3] (3): </b></ansiyellow>'),
-                        multiline=False
-                    ).strip()
+                    )
                 except (KeyboardInterrupt, EOFError):
+                    resume_status_bar(state)
                     ans = '3'
 
                 if ans == '1':
@@ -214,6 +241,7 @@ def main():
         if state.messages[1:]:
             save_session(state)
         trim_history(state)
+        draw_status_bar(state, force=True)
 
 
 if __name__ == '__main__':
