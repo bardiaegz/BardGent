@@ -1,7 +1,8 @@
 """Slash commands (/model, /clear, /resume, /plan, ...) and mode switching."""
-
+import datetime
 from rich.panel import Panel
 from rich.markup import escape
+from pathlib import Path
 
 from bardgent import config, skills, scheduler
 from bardgent.config import console, log_event
@@ -31,6 +32,7 @@ COMMANDS = {
     '/restore': 'Restore the working tree to a checkpoint: /restore <n>',
     '/schedule': 'Create a scheduled task: /schedule <spec> :: <prompt>. Manage: /schedule pause|resume|delete|run <id>',
     '/schedules': 'List scheduled tasks (next/last run, status)',
+    '/init': 'Analyze current project (files, structure, key configs) and generate/update AGENTS.md',
     '/exit': 'Quit Bardgent',
 }
 
@@ -207,6 +209,36 @@ def handle_command(user_input, state):
             elif not state.telegram_chat_id:
                 console.print('[dim]Note: Telegram isn\'t linked yet - run /telegram once to link it so results get delivered there too.[/dim]')
         return 'handled'
+
+    if cmd == '/init':
+        console.print('[bold cyan]Starting deep codebase analysis using the agent...[/bold cyan]')
+        
+        analysis_prompt = f"""You are an expert coding agent initializing this project.
+
+**Task**: Thoroughly explore the codebase and create/update `AGENTS.md` in the root with high-quality project context.
+
+Current working directory: {Path.cwd()}
+
+**Steps you must follow:**
+1. Use `Glob("**/*")`, `Glob("*.py")`, `Glob("**/*.md")` etc. to map the structure.
+2. Read key files: `README.md`, `pyproject.toml`, `requirements.txt`, main entry files, config files.
+3. Use `Grep` to find architecture clues, main functions, TODOs, important patterns.
+4. Summarize:
+   - Project purpose
+   - Tech stack
+   - Architecture
+   - Coding conventions
+   - Important files and their roles
+5. Write the final `AGENTS.md` using the `Write` tool.
+
+Make `AGENTS.md` professional, specific to this codebase, and useful for future sessions. Do not be generic."""
+
+        # Use Task via dispatch (correct way)
+        from bardgent.tool_schemas import dispatch_tool
+        result = dispatch_tool('Task', {'prompt': analysis_prompt}, state)
+        
+        console.print(Panel(str(result), title="✅ /init completed - Agent Analysis", border_style="green"))
+        return 'handled'    
 
     if cmd == '/exit':
         console.print('Goodbye!')
