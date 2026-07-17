@@ -49,7 +49,7 @@ Cycle with **Shift+Tab** or `/normal`, `/auto`, `/plan`.
 - **Memory:** save / list / delete long-term notes (`~/.bardgent/Bardgent.md`)  
 - **Skills:** Claude Code–style `SKILL.md` packs; `/skills`, `/skill install <github_url>`  
 - **Delegation:** `Task` / `Tasks` (parallel sub-agents)  
-- **Schedule:** recurring or one-off tasks; `/schedule`, `/schedules`
+- **Schedule:** recurring or one-off tasks; `/schedule`, `/schedules`. A detached **scheduler daemon** keeps firing tasks after you close the terminal (auto-started with Bardgent). Manage with `/schedule daemon status|start|stop`. Log: `~/.bardgent/scheduler.log`.
 
 ## Project instructions
 

@@ -78,7 +78,7 @@ from openai import (  # noqa: E402  (kept together with the retry schedule above
 
 # Transient / server-side only. 4xx client errors (bad history, bad schema,
 # auth, etc.) must not be retried — they will fail the same way every time.
-RETRYABLE_ERRORS = (APIConnectionError, APITimeoutError, RateLimitError, InternalServerError)
+RETRYABLE_ERRORS = (APIConnectionError, APITimeoutError, RateLimitError, InternalServerError, APIError)
 NON_RETRYABLE_ERRORS = (
     BadRequestError,
     AuthenticationError,

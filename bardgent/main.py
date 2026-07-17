@@ -43,6 +43,12 @@ def _prompt_user(prompt_session, state, message):
         resume_status_bar(state)
 
 def main():
+    # Detached scheduler process (keeps firing tasks after the terminal closes).
+    # Invoked by ensure_daemon_running(); not meant for interactive use.
+    if '--scheduler-daemon' in sys.argv:
+        scheduler.run_daemon_forever()
+        return
+
     if not os.environ.get('GEMINI_API_KEY'):
         console.print("[bold red]Error: GEMINI_API_KEY is not set.[/bold red]")
         console.print("Please set it in your environment or add it to ~/.bardgent/.env:")
@@ -79,12 +85,16 @@ def main():
     atexit.register(cleanup_jobs)
     install_resize_handler(state)
 
-    # Recurring/on-demand scheduled tasks (Cowork-style): a background thread
-    # that fires due tasks as isolated sub-agents and delivers results over
-    # Telegram, independent of this REPL loop - runs even while you're mid
-    # conversation. See /schedule, /schedules, and scheduler.py.
-    scheduler.start_scheduler()
-    atexit.register(scheduler.stop_scheduler)
+    # Recurring scheduled tasks run in a *detached* daemon process so they
+    # keep firing after you quit Bardgent / close the terminal. On-demand
+    # `/schedule run` still executes inside this process. See scheduler.py.
+    ok, daemon_msg = scheduler.ensure_daemon_running()
+    if ok:
+        console.print(f'[dim]Scheduler daemon: {daemon_msg}[/dim]')
+    else:
+        console.print(f'[yellow]Scheduler daemon: {daemon_msg}[/yellow]')
+        console.print('[yellow]Scheduled tasks will not run until the daemon is up '
+                      '(/schedule daemon start).[/yellow]')
 
     auto_continue = False
     while True:

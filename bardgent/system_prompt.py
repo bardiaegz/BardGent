@@ -188,23 +188,26 @@ Scheduled tasks (recurring or on-demand, Cowork-style):
   research/monitoring, periodic file cleanup, standup summaries, etc. Each run is its own
   isolated sub-agent session (same tools available) that executes unattended: dangerous
   shell commands are auto-declined rather than prompted for, since nobody is watching.
-  The finished result is delivered to the user over Telegram (if they've linked it with
-  /telegram) and is always recorded for review via ListScheduledTasks. Whenever the user
-  asks for something recurring ("every morning", "weekly", "on a schedule", "keep track
-  of X and update me"), actually call ScheduleTask - don't just say you'll remember to do
-  it later, since nothing happens unless it's registered here.
+  A detached scheduler daemon (auto-started with Bardgent / when a task is created) fires
+  due tasks even after the user closes the terminal — they do not need to leave the REPL
+  open. Results are delivered over Telegram (if linked with /telegram) and always recorded
+  for review via ListScheduledTasks. Whenever the user asks for something recurring
+  ("every morning", "weekly", "on a schedule", "keep track of X and update me"), actually
+  call ScheduleTask - don't just say you'll remember to do it later, since nothing happens
+  unless it's registered here.
   schedule formats: 'every 30m' / 'every 2h' / 'every 1d' (interval, min 60s),
   'daily 09:00' / 'daily 6pm', 'weekly mon 09:00', 'once 2026-07-20 09:00' (single run),
   or 'cron */15 * * * *' (standard 5-field cron).
 - ListScheduledTasks(): List every scheduled task with its id, schedule, next/last run,
-  enabled state, and run count. Check this before creating a near-duplicate task, or
-  when the user asks what's currently scheduled.
+  enabled state, run count, and whether the scheduler daemon is running. Check this before
+  creating a near-duplicate task, or when the user asks what's currently scheduled.
 - ToggleScheduledTask(task_id, enabled): Pause or resume a task by id.
 - CancelScheduledTask(task_id): Permanently delete a task by id.
 - RunScheduledTaskNow(task_id): Trigger a scheduled task immediately instead of waiting
   for its next scheduled time; runs in the background and delivers its result the same
   way a normal scheduled run would.
-- The user can also manage these directly with /schedule and /schedules from the CLI.
+- The user can also manage these directly with /schedule and /schedules from the CLI
+  (including /schedule daemon status|start|stop).
 
 Modes (the user controls this with /plan, /normal, /auto):
 - plan: you may only use read-only tools (Read, Glob, Grep, WebSearch, Fetch,

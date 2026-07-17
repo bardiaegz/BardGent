@@ -310,9 +310,18 @@ def dispatch_tool(name, args, state):
             if sched_err:
                 return f"Error: could not create scheduled task: {sched_err}"
             nr = scheduler.format_dt(task.get('next_run'))
+            st = scheduler.daemon_status()
+            daemon_note = (
+                f"Scheduler daemon is running (pid {st['pid']}); the task keeps firing "
+                f"even after the terminal is closed."
+                if st['running'] else
+                "Warning: scheduler daemon is NOT running — start Bardgent or use "
+                "/schedule daemon start so the task actually fires."
+            )
             return (
                 f"Scheduled task created: {task['id']} (\"{task['name']}\"). "
                 f"Schedule: {task['schedule_spec']}. Next run: {nr}. "
+                f"{daemon_note} "
                 f"Results will be sent over Telegram if linked (/telegram), and are always "
                 f"visible via ListScheduledTasks / /schedules."
             )

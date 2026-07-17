@@ -16,21 +16,37 @@ Schedule specs (case-insensitive), typed by the user or the model:
     once 2026-07-20 09:00 | once 6pm          -> a single one-off run
     cron */15 * * * *                        -> standard 5-field cron
 
-A single background thread (started once from main.py) wakes up
-periodically, finds any enabled task whose next_run has passed, and runs it
-via subagents.run_subagent(..., unattended=True) - unattended so a
-dangerous shell command can never block forever waiting on a y/N prompt
-nobody is there to answer.
+Scheduler daemon:
+    A detached process (not tied to the interactive terminal) wakes up
+    periodically, finds any enabled task whose next_run has passed, and runs
+    it via subagents.run_subagent(..., unattended=True) - unattended so a
+    dangerous shell command can never block forever waiting on a y/N prompt
+    nobody is there to answer.
+
+    The daemon is started automatically when Bardgent launches or when a
+    scheduled task is created. It keeps running after you close the REPL /
+    terminal (survives SIGHUP). It does *not* survive a full machine reboot
+    unless you add a launchd/cron unit yourself.
+
+    PID / lock files:
+        ~/.bardgent/scheduler.pid
+        ~/.bardgent/scheduler.lock
+        ~/.bardgent/schedule_running/<task_id>.pid  (cross-process run lock)
 
 On-demand runs (/schedule run <id>, or the RunScheduledTaskNow tool) use the
 exact same executor, just triggered immediately instead of by the clock.
 """
 
+import os
 import re
+import sys
 import json
 import uuid
+import signal
 import threading
+import subprocess
 from datetime import datetime, timedelta
+from pathlib import Path
 
 from rich.panel import Panel
 
@@ -39,6 +55,10 @@ from bardgent.config import console, console_lock, log_event
 from bardgent.telegram import _load_telegram_chat_id, send_telegram_message
 
 SCHEDULE_FILE = config.GLOBAL_DIR / 'scheduled_tasks.json'
+DAEMON_PID_FILE = config.GLOBAL_DIR / 'scheduler.pid'
+DAEMON_LOCK_FILE = config.GLOBAL_DIR / 'scheduler.lock'
+DAEMON_LOG_FILE = config.GLOBAL_DIR / 'scheduler.log'
+RUNNING_DIR = config.GLOBAL_DIR / 'schedule_running'
 
 _WEEKDAYS = {
     'mon': 0, 'monday': 0,
@@ -357,6 +377,9 @@ def add_task(prompt, schedule_spec, name=None):
         save_tasks(tasks)
 
     log_event(f"SCHEDULE CREATED {task_id}: {schedule_spec!r} -> {prompt[:80]!r}")
+    # Keep the detached daemon alive so the new task fires even if the user
+    # closes the terminal right after creating it.
+    ensure_daemon_running()
     return task, None
 
 
@@ -382,6 +405,8 @@ def set_enabled(task_id, enabled):
                     t['next_run'] = nxt.isoformat() if nxt else None
                 save_tasks(tasks)
                 log_event(f"SCHEDULE {'RESUMED' if enabled else 'PAUSED'} {task_id}")
+                if enabled:
+                    ensure_daemon_running()
                 return True
     return False
 
@@ -396,18 +421,32 @@ def format_dt(iso):
         return iso
 
 
+def list_tasks(tasks=None):
+    """Return raw task list for API consumption."""
+    tasks = tasks if tasks is not None else load_tasks()
+    return tasks
+
+
 def list_tasks_text(tasks=None):
     tasks = tasks if tasks is not None else load_tasks()
+    status = daemon_status()
+    if status['running']:
+        header = f"Scheduler daemon: running (pid {status['pid']}) — keeps firing after you close the terminal"
+    else:
+        header = (
+            "Scheduler daemon: NOT running — tasks will not fire until Bardgent starts "
+            "(or /schedule daemon start). Closing the terminal without a daemon stops schedules."
+        )
     if not tasks:
-        return '(no scheduled tasks yet. Create one with /schedule <spec> :: <prompt>)'
-    lines = []
+        return header + '\n\n(no scheduled tasks yet. Create one with /schedule <spec> :: <prompt>)'
+    lines = [header, '']
     for t in tasks:
-        status = 'enabled' if t.get('enabled') else 'paused'
+        enabled = 'enabled' if t.get('enabled') else 'paused'
         next_run = format_dt(t.get('next_run'))
         last_run = format_dt(t.get('last_run')) if t.get('last_run') else 'never'
         last_status = t.get('last_status') or '-'
         lines.append(
-            f"{t['id']}  [{status}]  \"{t['name']}\"\n"
+            f"{t['id']}  [{enabled}]  \"{t['name']}\"\n"
             f"    schedule: {t['schedule_spec']}\n"
             f"    next run: {next_run}   last run: {last_run} ({last_status})   "
             f"runs so far: {t.get('run_count', 0)}"
@@ -424,29 +463,126 @@ def list_tasks_text(tasks=None):
 # them more headroom than the default 15 before giving up.
 SCHEDULED_TASK_MAX_ITERS = 40
 
-# Guards against the same task executing twice at once - e.g. the periodic
-# scheduler loop firing a due task right as someone also triggers it with
-# /schedule run or RunScheduledTaskNow. Without this, both runs execute
-# concurrently and both delivered results land in Telegram, which looks like
-# the task ran multiple times on its own.
+# In-process guard (thread safety within one process). Cross-process safety
+# uses RUNNING_DIR marker files so the daemon and a live REPL can't both run
+# the same task at once.
 _running_task_ids = set()
 _running_lock = threading.Lock()
 
 
+def _running_marker_path(task_id):
+    return RUNNING_DIR / f'{task_id}.pid'
+
+
+def _pid_is_alive(pid):
+    if not pid or pid <= 0:
+        return False
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        # Exists but we can't signal it.
+        pass
+    except OSError:
+        return False
+    return True
+
+
+def _is_scheduler_daemon_process(pid):
+    """True if pid is alive and looks like our --scheduler-daemon process."""
+    if not _pid_is_alive(pid):
+        return False
+    try:
+        out = subprocess.check_output(
+            ['ps', '-p', str(pid), '-o', 'args='],
+            text=True, stderr=subprocess.DEVNULL,
+        ).strip()
+    except (OSError, subprocess.CalledProcessError):
+        # ps failed; fall back to bare liveness (best effort).
+        return _pid_is_alive(pid)
+    if not out:
+        return False
+    return '--scheduler-daemon' in out
+
+
+def _try_claim_task_run(task_id):
+    """Cross-process exclusive claim for one task run. Returns True if claimed."""
+    RUNNING_DIR.mkdir(parents=True, exist_ok=True)
+    marker = _running_marker_path(task_id)
+    for _ in range(2):
+        try:
+            fd = os.open(str(marker), os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+            try:
+                os.write(fd, str(os.getpid()).encode('utf-8'))
+            finally:
+                os.close(fd)
+            return True
+        except FileExistsError:
+            try:
+                old_pid = int(marker.read_text(encoding='utf-8').strip())
+            except (OSError, ValueError):
+                old_pid = None
+            if old_pid and _pid_is_alive(old_pid):
+                return False
+            # Stale marker from a crashed process — remove and retry once.
+            try:
+                marker.unlink()
+            except OSError:
+                return False
+    return False
+
+
+def _release_task_run(task_id):
+    marker = _running_marker_path(task_id)
+    try:
+        if not marker.exists():
+            return
+        try:
+            owner = int(marker.read_text(encoding='utf-8').strip())
+        except (OSError, ValueError):
+            owner = None
+        if owner is None or owner == os.getpid():
+            marker.unlink()
+    except OSError:
+        pass
+
+
 def is_task_running(task_id):
     with _running_lock:
-        return task_id in _running_task_ids
+        if task_id in _running_task_ids:
+            return True
+    marker = _running_marker_path(task_id)
+    if not marker.exists():
+        return False
+    try:
+        pid = int(marker.read_text(encoding='utf-8').strip())
+    except (OSError, ValueError):
+        return False
+    if _pid_is_alive(pid):
+        return True
+    try:
+        marker.unlink()
+    except OSError:
+        pass
+    return False
 
 
 def _execute_scheduled_task(task_id):
     """Run one scheduled task to completion (blocking) and record/deliver
-    the result. Safe to call directly from a background thread. No-ops if
-    this task is already running elsewhere (see _running_task_ids above)."""
+    the result. Safe to call from a background thread or the daemon process.
+    No-ops if this task is already running in this process or another."""
     with _running_lock:
         if task_id in _running_task_ids:
-            log_event(f"SCHEDULE RUN SKIPPED {task_id}: already running elsewhere")
+            log_event(f"SCHEDULE RUN SKIPPED {task_id}: already running in this process")
             return
         _running_task_ids.add(task_id)
+
+    if not _try_claim_task_run(task_id):
+        with _running_lock:
+            _running_task_ids.discard(task_id)
+        log_event(f"SCHEDULE RUN SKIPPED {task_id}: already running elsewhere")
+        return
 
     try:
         tasks = load_tasks()
@@ -517,6 +653,7 @@ def _execute_scheduled_task(task_id):
             ))
         log_event(f"SCHEDULE RUN DONE {task_id} status={status}")
     finally:
+        _release_task_run(task_id)
         with _running_lock:
             _running_task_ids.discard(task_id)
 
@@ -535,10 +672,9 @@ def run_task_in_background(task_id):
 
 
 # ---------------------------------------------------------------------------
-# Background scheduler thread
+# Scheduler loop (used by the detached daemon process)
 # ---------------------------------------------------------------------------
 
-_scheduler_thread = None
 _scheduler_stop = threading.Event()
 DEFAULT_CHECK_INTERVAL_SECONDS = 20
 
@@ -560,9 +696,8 @@ def _check_and_run_due_tasks():
         if next_run_dt <= now:
             due_ids.append(t['id'])
     for task_id in due_ids:
-        # Run sequentially in this thread: scheduled tasks are typically
-        # infrequent, and running them one at a time avoids many sub-agents
-        # fighting over the same terminal/console at once.
+        # Run sequentially: scheduled tasks are typically infrequent, and
+        # running them one at a time avoids many sub-agents at once.
         _execute_scheduled_task(task_id)
 
 
@@ -572,22 +707,297 @@ def _scheduler_loop(check_interval):
             _check_and_run_due_tasks()
         except Exception as e:
             log_event(f"SCHEDULER LOOP ERROR: {type(e).__name__}: {e}")
-        _scheduler_stop.wait(check_interval)
+        # Wait in 1s slices so SIGTERM is acted on promptly even if a single
+        # long wait is in progress when the signal arrives.
+        remaining = float(check_interval)
+        while remaining > 0 and not _scheduler_stop.is_set():
+            slice_ = min(1.0, remaining)
+            if _scheduler_stop.wait(slice_):
+                break
+            remaining -= slice_
 
 
-def start_scheduler(check_interval=DEFAULT_CHECK_INTERVAL_SECONDS):
-    global _scheduler_thread
-    if _scheduler_thread and _scheduler_thread.is_alive():
-        return
+# ---------------------------------------------------------------------------
+# Detached scheduler daemon (survives closing the terminal)
+# ---------------------------------------------------------------------------
+
+def _read_daemon_pid():
+    try:
+        if not DAEMON_PID_FILE.exists():
+            return None
+        return int(DAEMON_PID_FILE.read_text(encoding='utf-8').strip())
+    except (OSError, ValueError):
+        return None
+
+
+def _write_daemon_pid(pid):
+    try:
+        config.GLOBAL_DIR.mkdir(exist_ok=True)
+        DAEMON_PID_FILE.write_text(str(pid), encoding='utf-8')
+    except OSError as e:
+        log_event(f"SCHEDULER DAEMON: failed to write pid file: {e}")
+
+
+def _clear_daemon_pid():
+    try:
+        if DAEMON_PID_FILE.exists():
+            DAEMON_PID_FILE.unlink()
+    except OSError:
+        pass
+
+
+def daemon_status():
+    """Return {'running': bool, 'pid': int|None}."""
+    pid = _read_daemon_pid()
+    if pid and _is_scheduler_daemon_process(pid):
+        return {'running': True, 'pid': pid}
+    if pid:
+        # Stale pid file or PID reused by an unrelated process.
+        _clear_daemon_pid()
+    return {'running': False, 'pid': None}
+
+
+def _daemon_command():
+    """Argv to re-enter this package as the long-lived scheduler process."""
+    # Prefer the installed console script when available; fall back to
+    # `python -m bardgent` so editable installs and source trees both work.
+    return [sys.executable, '-m', 'bardgent', '--scheduler-daemon']
+
+
+def ensure_daemon_running(cwd=None):
+    """Start the detached scheduler daemon if it is not already running.
+
+    Returns (ok: bool, message: str). Safe to call from the REPL or tools;
+    closing the terminal does not stop a successfully started daemon.
+    """
+    import time
+
+    status = daemon_status()
+    if status['running']:
+        return True, f"scheduler daemon already running (pid {status['pid']})"
+
+    if not os.environ.get('GEMINI_API_KEY'):
+        # Child also loads ~/.bardgent/.env via config, but if the parent has
+        # no key either, the daemon would just spin and fail every run.
+        from dotenv import dotenv_values
+        env_file = Path.home() / '.bardgent' / '.env'
+        file_vals = dotenv_values(env_file) if env_file.exists() else {}
+        if not (file_vals.get('GEMINI_API_KEY') or os.environ.get('GEMINI_API_KEY')):
+            return False, "cannot start scheduler daemon: GEMINI_API_KEY is not set"
+
+    try:
+        config.GLOBAL_DIR.mkdir(exist_ok=True)
+        log_f = open(DAEMON_LOG_FILE, 'a', encoding='utf-8')
+    except OSError as e:
+        return False, f"cannot open scheduler log: {e}"
+
+    cmd = _daemon_command()
+    child_env = os.environ.copy()
+    # Line-buffered logs when stdout is redirected to a file.
+    child_env['PYTHONUNBUFFERED'] = '1'
+    popen_kwargs = {
+        'stdin': subprocess.DEVNULL,
+        'stdout': log_f,
+        'stderr': subprocess.STDOUT,
+        'close_fds': True,
+        'cwd': cwd or os.getcwd(),
+        'env': child_env,
+    }
+    if sys.platform == 'win32':
+        # DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP
+        popen_kwargs['creationflags'] = 0x00000008 | 0x00000200
+    else:
+        # New session so closing the terminal (SIGHUP) does not kill the daemon.
+        popen_kwargs['start_new_session'] = True
+
+    try:
+        proc = subprocess.Popen(cmd, **popen_kwargs)
+    except OSError as e:
+        try:
+            log_f.close()
+        except OSError:
+            pass
+        return False, f"failed to spawn scheduler daemon: {e}"
+
+    # Parent no longer needs the log fd; child has its own dup.
+    try:
+        log_f.close()
+    except OSError:
+        pass
+
+    # Give the child a moment to write its pid / take the lock.
+    for _ in range(30):
+        time.sleep(0.1)
+        status = daemon_status()
+        if status['running']:
+            log_event(f"SCHEDULER DAEMON started pid={status['pid']}")
+            return True, f"scheduler daemon started (pid {status['pid']})"
+        if proc.poll() is not None:
+            # Child exited immediately — surface last log lines if any.
+            tail = ''
+            try:
+                if DAEMON_LOG_FILE.exists():
+                    lines = DAEMON_LOG_FILE.read_text(encoding='utf-8', errors='replace').splitlines()
+                    tail = '\n'.join(lines[-8:]) if lines else ''
+            except OSError:
+                pass
+            msg = f"scheduler daemon exited immediately (code {proc.returncode})"
+            if tail:
+                msg += f"\nLast log lines:\n{tail}"
+            log_event(f"SCHEDULER DAEMON START FAILED: {msg}")
+            return False, msg
+
+    # Process still alive but pid file not written yet — trust the spawn.
+    if proc.poll() is None and _is_scheduler_daemon_process(proc.pid):
+        _write_daemon_pid(proc.pid)
+        log_event(f"SCHEDULER DAEMON started pid={proc.pid} (pid file written by parent)")
+        return True, f"scheduler daemon started (pid {proc.pid})"
+
+    return False, "scheduler daemon failed to start"
+
+
+def stop_daemon(timeout=5.0):
+    """Ask the detached scheduler daemon to exit. Returns (ok, message)."""
+    import time
+
+    status = daemon_status()
+    if not status['running']:
+        _clear_daemon_pid()
+        return True, "scheduler daemon is not running"
+
+    pid = status['pid']
+    try:
+        os.kill(pid, signal.SIGTERM)
+    except ProcessLookupError:
+        _clear_daemon_pid()
+        return True, "scheduler daemon is not running"
+    except OSError as e:
+        return False, f"failed to signal daemon pid {pid}: {e}"
+
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        if not _is_scheduler_daemon_process(pid):
+            _clear_daemon_pid()
+            log_event(f"SCHEDULER DAEMON stopped pid={pid}")
+            return True, f"scheduler daemon stopped (was pid {pid})"
+        time.sleep(0.1)
+
+    # Still our daemon — escalate.
+    if _is_scheduler_daemon_process(pid):
+        try:
+            os.kill(pid, signal.SIGKILL)
+        except OSError:
+            pass
+        # Brief wait for SIGKILL to take effect.
+        for _ in range(20):
+            if not _pid_is_alive(pid):
+                break
+            time.sleep(0.05)
+        _clear_daemon_pid()
+        log_event(f"SCHEDULER DAEMON killed pid={pid}")
+        return True, f"scheduler daemon force-killed (was pid {pid})"
+
+    _clear_daemon_pid()
+    return True, f"scheduler daemon stopped (was pid {pid})"
+
+
+def _acquire_daemon_lock():
+    """Exclusive lock so only one daemon instance runs. Returns open file or None."""
+    try:
+        config.GLOBAL_DIR.mkdir(exist_ok=True)
+        lock_f = open(DAEMON_LOCK_FILE, 'a+', encoding='utf-8')
+    except OSError as e:
+        log_event(f"SCHEDULER DAEMON: cannot open lock file: {e}")
+        return None
+
+    try:
+        if sys.platform == 'win32':
+            # Best-effort on Windows: rely on pid file alone.
+            return lock_f
+        import fcntl
+        fcntl.flock(lock_f.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        return lock_f
+    except BlockingIOError:
+        lock_f.close()
+        log_event("SCHEDULER DAEMON: another instance already holds the lock")
+        return None
+    except OSError as e:
+        lock_f.close()
+        log_event(f"SCHEDULER DAEMON: flock failed: {e}")
+        return None
+
+
+def run_daemon_forever(check_interval=DEFAULT_CHECK_INTERVAL_SECONDS):
+    """Entry point for `bardgent --scheduler-daemon`.
+
+    Blocks forever (or until SIGTERM/SIGINT), running due tasks on a timer.
+    This process is detached from the user's terminal so schedules keep firing
+    after the REPL exits.
+    """
+    lock_f = _acquire_daemon_lock()
+    if lock_f is None:
+        # Another daemon is already running — exit quietly so ensure_daemon
+        # can still report success via the existing pid.
+        os._exit(0)
+
+    _write_daemon_pid(os.getpid())
     _scheduler_stop.clear()
-    _scheduler_thread = threading.Thread(
-        target=_scheduler_loop, args=(check_interval,),
-        daemon=True, name='bardgent-scheduler',
-    )
-    _scheduler_thread.start()
-    log_event("SCHEDULER started")
+    _cleaned = {'done': False}
+
+    def _shutdown(signum=None, frame=None):
+        try:
+            log_event(f"SCHEDULER DAEMON received signal {signum}; shutting down")
+        except Exception:
+            pass
+        _scheduler_stop.set()
+
+    signal.signal(signal.SIGTERM, _shutdown)
+    signal.signal(signal.SIGINT, _shutdown)
+
+    def _cleanup():
+        if _cleaned['done']:
+            return
+        _cleaned['done'] = True
+        _clear_daemon_pid()
+        try:
+            if sys.platform != 'win32':
+                import fcntl
+                try:
+                    fcntl.flock(lock_f.fileno(), fcntl.LOCK_UN)
+                except (OSError, ValueError):
+                    pass
+            try:
+                lock_f.close()
+            except (OSError, ValueError):
+                pass
+        except Exception:
+            pass
+
+    log_event(f"SCHEDULER DAEMON ready pid={os.getpid()} interval={check_interval}s")
+    try:
+        _scheduler_loop(check_interval)
+    finally:
+        _cleanup()
+        try:
+            log_event(f"SCHEDULER DAEMON exit pid={os.getpid()}")
+        except Exception:
+            pass
+        # Hard-exit so non-daemon threads / atexit hooks from imported libs
+        # cannot keep the process alive after the scheduler loop ends.
+        os._exit(0)
+
+
+# Back-compat aliases used by older call sites / docs.
+def start_scheduler(check_interval=DEFAULT_CHECK_INTERVAL_SECONDS):
+    """Ensure the detached daemon is running (replaces the old in-process thread)."""
+    ok, msg = ensure_daemon_running()
+    log_event(f"SCHEDULER start_scheduler: {msg}")
+    return ok
 
 
 def stop_scheduler():
-    _scheduler_stop.set()
-    log_event("SCHEDULER stopped")
+    """No-op for REPL exit: the daemon must keep running after the terminal closes.
+
+    Use stop_daemon() (or /schedule daemon stop) to shut it down deliberately.
+    """
+    log_event("SCHEDULER stop_scheduler: leaving detached daemon running")

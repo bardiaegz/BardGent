@@ -30,8 +30,8 @@ COMMANDS = {
     '/skill install': 'Install a skill from GitHub: /skill install <github_url>',
     '/checkpoints': 'List recent git checkpoints (auto-created on Write/Edit)',
     '/restore': 'Restore the working tree to a checkpoint: /restore <n>',
-    '/schedule': 'Create a scheduled task: /schedule <spec> :: <prompt>. Manage: /schedule pause|resume|delete|run <id>',
-    '/schedules': 'List scheduled tasks (next/last run, status)',
+    '/schedule': 'Create a scheduled task: /schedule <spec> :: <prompt>. Manage: /schedule pause|resume|delete|run <id> | daemon status|start|stop',
+    '/schedules': 'List scheduled tasks (next/last run, status) and daemon state',
     '/init': 'Analyze current project (files, structure, key configs) and generate/update AGENTS.md',
     '/exit': 'Quit Bardgent',
 }
@@ -50,11 +50,17 @@ SCHEDULE_HELP = (
     "  Example:\n"
     "    /schedule daily 09:00 :: Summarize my unread Slack messages from the last 24 hours\n"
     "  Manage existing tasks:\n"
-    "    /schedules                (list all)\n"
+    "    /schedules                (list all + daemon status)\n"
     "    /schedule pause <id>\n"
     "    /schedule resume <id>\n"
     "    /schedule delete <id>\n"
-    "    /schedule run <id>        (run it right now, on demand)"
+    "    /schedule run <id>        (run it right now, on demand)\n"
+    "  Daemon (survives closing the terminal):\n"
+    "    /schedule daemon status\n"
+    "    /schedule daemon start\n"
+    "    /schedule daemon stop\n"
+    "  Note: tasks keep firing after you quit Bardgent as long as the daemon is\n"
+    "  running. A full machine reboot stops the daemon until Bardgent starts again."
 )
 
 
@@ -166,6 +172,32 @@ def handle_command(user_input, state):
             return 'handled'
 
         first_word = rest.split(maxsplit=1)[0].lower()
+        if first_word == 'daemon':
+            parts = rest.split(maxsplit=1)
+            action = parts[1].strip().lower() if len(parts) > 1 else 'status'
+            if action in ('status', ''):
+                st = scheduler.daemon_status()
+                if st['running']:
+                    console.print(
+                        f'[green]Scheduler daemon running[/green] (pid {st["pid"]}). '
+                        f'Tasks keep firing after you close the terminal. '
+                        f'Log: ~/.bardgent/scheduler.log'
+                    )
+                else:
+                    console.print(
+                        '[yellow]Scheduler daemon is not running.[/yellow] '
+                        'Start it with /schedule daemon start (or just open Bardgent).'
+                    )
+            elif action == 'start':
+                ok, msg = scheduler.ensure_daemon_running()
+                console.print(f'[green]{msg}[/green]' if ok else f'[red]{msg}[/red]')
+            elif action == 'stop':
+                ok, msg = scheduler.stop_daemon()
+                console.print(f'[green]{msg}[/green]' if ok else f'[red]{msg}[/red]')
+            else:
+                console.print('[yellow]Usage: /schedule daemon status|start|stop[/yellow]')
+            return 'handled'
+
         if first_word in ('pause', 'resume', 'delete', 'remove', 'cancel', 'run'):
             parts = rest.split(maxsplit=1)
             if len(parts) < 2:
@@ -204,6 +236,16 @@ def handle_command(user_input, state):
         else:
             nr_text = scheduler.format_dt(task.get('next_run'))
             console.print(f'[bold green]Scheduled task created:[/bold green] {task["id"]}  (next run: {nr_text})')
+            st = scheduler.daemon_status()
+            if st['running']:
+                console.print(
+                    f'[dim]Daemon running (pid {st["pid"]}) — this task will still fire if you close the terminal.[/dim]'
+                )
+            else:
+                console.print(
+                    '[yellow]Warning: scheduler daemon is not running. '
+                    'Use /schedule daemon start so tasks fire after you quit.[/yellow]'
+                )
             if not config.TELEGRAM_BOT_TOKEN:
                 console.print('[dim]Note: no TELEGRAM_BOT_TOKEN configured, results will only be visible via /schedules, not delivered to Telegram.[/dim]')
             elif not state.telegram_chat_id:
